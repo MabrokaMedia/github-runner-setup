@@ -6,6 +6,13 @@ inputs:
   workspace:
     description: Path to the cargo workspace (must match the restore step).
     required: true
+  key:
+    description: Cache key from the restore step's `key` output. Required — pairs with the restore.
+    required: true
+  cache-hit:
+    description: cache-hit output from the restore step. If "true", save is skipped.
+    required: false
+    default: ""
   bucket:
     description: S3 bucket name.
     required: false
@@ -14,18 +21,6 @@ inputs:
     description: AWS region.
     required: false
     default: us-east-1
-  key-prefix:
-    description: Extra prefix for cache key (must match the restore step).
-    required: false
-    default: ${{ github.repository }}
-  shared-key:
-    description: Override key (must match the restore step).
-    required: false
-    default: ""
-  cache-hit:
-    description: Output from the restore step. If "true" and shared-key is empty, save is skipped.
-    required: false
-    default: ""
 
 runs:
   using: composite
@@ -35,20 +30,15 @@ runs:
       env:
         AWS_DEFAULT_REGION: ${{ inputs.region }}
         BUCKET: ${{ inputs.bucket }}
+        KEY: ${{ inputs.key }}
       run: |
         set -euo pipefail
-        WORKSPACE_ABS="$(cd "${{ inputs.workspace }}" && pwd)"
-        if [[ -n "${{ inputs.shared-key }}" ]]; then
-          KEY="${{ inputs.key-prefix }}/${{ inputs.shared-key }}"
-        else
-          HASH=$(find "${WORKSPACE_ABS}" -name Cargo.lock -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 | head -c 16)
-          KEY="${{ inputs.key-prefix }}/rust/${HASH}"
-        fi
         echo "cache key: ${KEY}"
-        if [[ "${{ inputs.cache-hit }}" == "true" ]] && [[ -z "${{ inputs.shared-key }}" ]]; then
+        if [[ "${{ inputs.cache-hit }}" == "true" ]]; then
           echo "cache already populated (cache-hit=true), skipping save"
           exit 0
         fi
+        WORKSPACE_ABS="$(cd "${{ inputs.workspace }}" && pwd)"
         command -v zstd >/dev/null || sudo dnf install -y zstd >/dev/null 2>&1 || sudo apt-get install -y zstd >/dev/null 2>&1
         CARGO_ROOT="${CARGO_HOME:-$HOME/.cargo}"
         PATHS=()

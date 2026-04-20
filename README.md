@@ -25,6 +25,7 @@ steps:
     uses: MabrokaMedia/github-runner-setup/rust-s3-cache/save@main
     with:
       workspace: .
+      key: ${{ steps.rust-cache.outputs.key }}
       cache-hit: ${{ steps.rust-cache.outputs.cache-hit }}
 ```
 

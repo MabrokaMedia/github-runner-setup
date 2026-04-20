@@ -47,7 +47,7 @@ runs:
         if [[ -n "${{ inputs.shared-key }}" ]]; then
           KEY="${{ inputs.key-prefix }}/${{ inputs.shared-key }}"
         else
-          HASH=$(find "${WORKSPACE_ABS}" -name Cargo.lock -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 | head -c 16)
+          HASH=$(find "${WORKSPACE_ABS}" -type d -name target -prune -o -type f -name Cargo.lock -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 | head -c 16)
           KEY="${{ inputs.key-prefix }}/rust/${HASH}"
         fi
         echo "key=${KEY}" >> "$GITHUB_OUTPUT"
