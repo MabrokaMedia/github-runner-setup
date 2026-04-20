@@ -437,7 +437,7 @@ if [[ "$LT_EXISTS" -gt 0 ]]; then
             \"BlockDeviceMappings\": [{
                 \"DeviceName\": \"/dev/xvda\",
                 \"Ebs\": {
-                    \"VolumeSize\": 30,
+                    \"VolumeSize\": 80,
                     \"VolumeType\": \"gp3\",
                     \"DeleteOnTermination\": true
                 }
@@ -471,7 +471,7 @@ else
             \"BlockDeviceMappings\": [{
                 \"DeviceName\": \"/dev/xvda\",
                 \"Ebs\": {
-                    \"VolumeSize\": 30,
+                    \"VolumeSize\": 80,
                     \"VolumeType\": \"gp3\",
                     \"DeleteOnTermination\": true
                 }
