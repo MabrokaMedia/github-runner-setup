@@ -1,6 +1,10 @@
 """
 Lambda function: GitHub Actions Runner Auto-Scaler
-Receives workflow_job webhooks from GitHub, scales ASG up for queued jobs.
+Receives workflow_job webhooks from GitHub, scales the appropriate ASG up for queued jobs.
+
+Routes by label:
+  - label "small" -> gh-runner-small-asg (c7g.large tier)
+  - else         -> gh-runner-asg       (c7g.2xlarge tier)
 """
 
 import json
@@ -12,24 +16,37 @@ import boto3
 autoscaling = boto3.client("autoscaling")
 ssm = boto3.client("ssm")
 
-ASG_NAME = os.environ["ASG_NAME"]
-MAX_RUNNERS = int(os.environ.get("MAX_RUNNERS", "3"))
+FAST_ASG = os.environ.get("FAST_ASG_NAME", os.environ.get("ASG_NAME", "gh-runner-asg"))
+SMALL_ASG = os.environ.get("SMALL_ASG_NAME", "gh-runner-small-asg")
+MAX_RUNNERS = int(os.environ.get("MAX_RUNNERS", "10"))
 WEBHOOK_SECRET_PARAM = os.environ["WEBHOOK_SECRET_PARAM"]
-RUNNER_LABELS = set(os.environ.get("RUNNER_LABELS", "self-hosted").split(","))
+# Common discriminator labels our workflows set — if present, job is for our runners
+BASE_LABELS = {"self-hosted", "arm64"}
 
 
 def verify_signature(body: str, signature: str, secret: str) -> bool:
-    """Verify GitHub webhook HMAC-SHA256 signature."""
     expected = "sha256=" + hmac.new(
         secret.encode(), body.encode(), hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
 
 
-def get_asg_state():
-    """Get current ASG desired capacity and running instance count."""
+def pick_asg(job_labels: set) -> str | None:
+    """Decide which ASG handles this job, or None if it's not ours."""
+    # Must at least claim the base labels
+    if not BASE_LABELS.issubset(job_labels):
+        return None
+    if "small" in job_labels:
+        return SMALL_ASG
+    if "fast" in job_labels:
+        return FAST_ASG
+    # Default anything else matching base labels to fast
+    return FAST_ASG
+
+
+def get_asg_state(asg_name: str):
     resp = autoscaling.describe_auto_scaling_groups(
-        AutoScalingGroupNames=[ASG_NAME]
+        AutoScalingGroupNames=[asg_name]
     )
     asg = resp["AutoScalingGroups"][0]
     return {
@@ -41,35 +58,27 @@ def get_asg_state():
     }
 
 
-def scale_up():
-    """Increment ASG desired capacity by 1, up to MAX_RUNNERS.
-
-    If already at max, schedule a retry via EventBridge so queued jobs
-    get picked up once running runners finish and self-terminate.
-    """
-    state = get_asg_state()
+def scale_up(asg_name: str):
+    state = get_asg_state(asg_name)
     new_desired = min(state["desired"] + 1, MAX_RUNNERS)
-
     if new_desired <= state["desired"]:
-        print(f"Already at max capacity ({MAX_RUNNERS}). Scheduling retry in 90s.")
+        print(f"{asg_name}: already at max capacity ({MAX_RUNNERS}). Scheduling retry in 90s.")
         _schedule_retry()
         return False
-
     autoscaling.set_desired_capacity(
-        AutoScalingGroupName=ASG_NAME,
+        AutoScalingGroupName=asg_name,
         DesiredCapacity=new_desired,
     )
-    print(f"Scaled ASG from {state['desired']} to {new_desired}")
+    print(f"{asg_name}: scaled {state['desired']} -> {new_desired}")
     return True
 
 
 def _schedule_retry():
-    """Schedule this Lambda to re-check and scale in 90 seconds."""
     try:
         lambda_client = boto3.client("lambda")
         lambda_client.invoke(
             FunctionName=os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "gh-runner-scaler"),
-            InvocationType="Event",  # async
+            InvocationType="Event",
             Payload=json.dumps({"_retry": True}).encode(),
         )
         print("Scheduled async retry")
@@ -77,67 +86,30 @@ def _schedule_retry():
         print(f"Failed to schedule retry: {e}")
 
 
-def _count_queued_jobs():
-    """Query GitHub API for queued self-hosted jobs across the org."""
-    try:
-        import urllib.request
-        pat_resp = ssm.get_parameter(Name="/gh-runner/github-pat", WithDecryption=True)
-        pat = pat_resp["Parameter"]["Value"]
-        org_resp = ssm.get_parameter(Name="/gh-runner/org-name")
-        org = org_resp["Parameter"]["Value"]
-
-        # List org runners to find idle ones
-        req = urllib.request.Request(
-            f"https://api.github.com/orgs/{org}/actions/runners",
-            headers={"Authorization": f"token {pat}", "Accept": "application/vnd.github+json"},
-        )
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read())
-        idle = sum(1 for r in data.get("runners", []) if r["status"] == "online" and not r["busy"])
-        busy = sum(1 for r in data.get("runners", []) if r["status"] == "online" and r["busy"])
-        print(f"Runners: {busy} busy, {idle} idle, {data.get('total_count', 0)} total")
-        return idle, busy
-    except Exception as e:
-        print(f"Failed to query runners: {e}")
-        return 0, 0
-
-
 def handler(event, context):
-    # Periodic check from EventBridge: scale ASG to match demand
     if event.get("_periodic_check") or event.get("_retry"):
-        state = get_asg_state()
-        idle, busy = _count_queued_jobs()
-
-        # If there are idle runners, no need to scale (jobs will be picked up)
-        if idle > 0:
-            print(f"Periodic: {idle} idle runners available, no scale needed")
-            return {"statusCode": 200, "body": f"{idle} idle runners"}
-
-        # If no idle runners and ASG has room, scale up
-        if state["desired"] < MAX_RUNNERS:
-            new = min(state["desired"] + 2, MAX_RUNNERS)  # scale by 2 for faster catch-up
-            autoscaling.set_desired_capacity(
-                AutoScalingGroupName=ASG_NAME,
-                DesiredCapacity=new,
-            )
-            print(f"Periodic: scaled ASG from {state['desired']} to {new}")
-        else:
-            print(f"Periodic: at max ({MAX_RUNNERS}), waiting for runners to free up")
+        for asg in (FAST_ASG, SMALL_ASG):
+            try:
+                state = get_asg_state(asg)
+                if state["desired"] < MAX_RUNNERS:
+                    new = min(state["desired"] + 1, MAX_RUNNERS)
+                    autoscaling.set_desired_capacity(
+                        AutoScalingGroupName=asg, DesiredCapacity=new
+                    )
+                    print(f"Periodic: {asg} {state['desired']} -> {new}")
+            except Exception as e:
+                print(f"Periodic: {asg}: {e}")
         return {"statusCode": 200, "body": "Periodic check done"}
 
-    # Parse API Gateway v2 payload
     body = event.get("body", "")
     headers = {k.lower(): v for k, v in event.get("headers", {}).items()}
 
-    # Verify webhook signature
     signature = headers.get("x-hub-signature-256", "")
     secret_resp = ssm.get_parameter(Name=WEBHOOK_SECRET_PARAM, WithDecryption=True)
     secret = secret_resp["Parameter"]["Value"]
-
     if not verify_signature(body, signature, secret):
         return {"statusCode": 401, "body": "Invalid signature"}
 
-    # Parse event
     gh_event = headers.get("x-github-event", "")
     if gh_event != "workflow_job":
         return {"statusCode": 200, "body": "Ignored event: " + gh_event}
@@ -146,18 +118,17 @@ def handler(event, context):
     action = payload.get("action")
     job = payload.get("workflow_job", {})
     job_labels = set(job.get("labels", []))
-
     print(f"workflow_job action={action} labels={job_labels}")
 
-    # Only scale on queued jobs that request our runner labels
     if action != "queued":
         return {"statusCode": 200, "body": f"Ignored action: {action}"}
 
-    if not RUNNER_LABELS.intersection(job_labels):
+    target = pick_asg(job_labels)
+    if not target:
         return {"statusCode": 200, "body": "Labels don't match, skipping"}
 
-    scaled = scale_up()
+    scaled = scale_up(target)
     return {
         "statusCode": 200,
-        "body": "Scaled up" if scaled else "Already at max capacity",
+        "body": f"Scaled up {target}" if scaled else f"{target}: at max capacity",
     }
