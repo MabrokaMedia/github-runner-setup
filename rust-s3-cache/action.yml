@@ -36,14 +36,17 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        WORKSPACE_ABS="$(cd "${{ inputs.workspace }}" && pwd)"
+        echo "workspace-abs=${WORKSPACE_ABS}" >> "$GITHUB_OUTPUT"
         if [[ -n "${{ inputs.shared-key }}" ]]; then
           KEY="${{ inputs.key-prefix }}/${{ inputs.shared-key }}"
         else
-          HASH=$(find ${{ inputs.workspace }} -name Cargo.lock -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 | head -c 16)
+          HASH=$(find "${WORKSPACE_ABS}" -name Cargo.lock -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 | head -c 16)
           KEY="${{ inputs.key-prefix }}/rust/${HASH}"
         fi
         echo "key=${KEY}" >> "$GITHUB_OUTPUT"
         echo "cache key: ${KEY}"
+        echo "workspace (absolute): ${WORKSPACE_ABS}"
 
     - name: Restore cache from S3
       id: restore
@@ -52,13 +55,14 @@ runs:
         AWS_DEFAULT_REGION: ${{ inputs.region }}
         BUCKET: ${{ inputs.bucket }}
         KEY: ${{ steps.key.outputs.key }}
-        WORKSPACE: ${{ inputs.workspace }}
+        WORKSPACE_ABS: ${{ steps.key.outputs.workspace-abs }}
       run: |
         set -euo pipefail
         command -v zstd >/dev/null || sudo dnf install -y zstd >/dev/null 2>&1 || sudo apt-get install -y zstd >/dev/null 2>&1
-        mkdir -p "${WORKSPACE}/target" "${HOME}/.cargo/registry" "${HOME}/.cargo/git"
+        mkdir -p "${WORKSPACE_ABS}/target" "${HOME}/.cargo/registry" "${HOME}/.cargo/git"
         if aws s3api head-object --bucket "${BUCKET}" --key "${KEY}.tar.zst" >/dev/null 2>&1; then
-          echo "cache HIT: s3://${BUCKET}/${KEY}.tar.zst"
+          SIZE=$(aws s3api head-object --bucket "${BUCKET}" --key "${KEY}.tar.zst" --query ContentLength --output text)
+          echo "cache HIT: s3://${BUCKET}/${KEY}.tar.zst (${SIZE} bytes)"
           aws s3 cp "s3://${BUCKET}/${KEY}.tar.zst" - --no-progress \
             | zstd -d --long=27 \
             | tar -xf - -C /
@@ -75,7 +79,7 @@ runs:
         AWS_DEFAULT_REGION: ${{ inputs.region }}
         BUCKET: ${{ inputs.bucket }}
         KEY: ${{ steps.key.outputs.key }}
-        WORKSPACE: ${{ inputs.workspace }}
+        WORKSPACE_ABS: ${{ steps.key.outputs.workspace-abs }}
         CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
       run: |
         set -euo pipefail
@@ -84,7 +88,7 @@ runs:
           exit 0
         fi
         PATHS=()
-        [[ -d "${WORKSPACE}/target" ]] && PATHS+=("${WORKSPACE}/target")
+        [[ -d "${WORKSPACE_ABS}/target" ]] && PATHS+=("${WORKSPACE_ABS}/target")
         [[ -d "${HOME}/.cargo/registry" ]] && PATHS+=("${HOME}/.cargo/registry")
         [[ -d "${HOME}/.cargo/git" ]] && PATHS+=("${HOME}/.cargo/git")
         if [[ ${#PATHS[@]} -eq 0 ]]; then
