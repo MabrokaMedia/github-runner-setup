@@ -16,11 +16,19 @@ runs-on: [self-hosted, linux, arm64, fast]
 steps:
   - uses: actions/checkout@v4
   - uses: dtolnay/rust-toolchain@stable
-  - uses: MabrokaMedia/github-runner-setup/rust-s3-cache@main
+  - id: rust-cache
+    uses: MabrokaMedia/github-runner-setup/rust-s3-cache/restore@main
     with:
       workspace: .
   - run: cargo build --release
+  - if: always()
+    uses: MabrokaMedia/github-runner-setup/rust-s3-cache/save@main
+    with:
+      workspace: .
+      cache-hit: ${{ steps.rust-cache.outputs.cache-hit }}
 ```
+
+Composite actions can't register post-run hooks, so save is a separate action called after the build. `if: always()` keeps the cache alive even when the build fails.
 
 The runner IAM role already has scoped access to `s3://mabroka-ci-cache`, so no AWS credentials step is needed.
 

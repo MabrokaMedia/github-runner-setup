@@ -1,5 +1,5 @@
-name: Rust S3 cache
-description: Cache cargo registry + target/ via same-region S3 (zero egress cost).
+name: Rust S3 cache (restore)
+description: Restore cargo registry + target/ from same-region S3. Pair with rust-s3-cache/save.
 author: MabrokaMedia
 
 inputs:
@@ -7,19 +7,19 @@ inputs:
     description: Path to the cargo workspace (where Cargo.lock + target/ live).
     required: true
   bucket:
-    description: S3 bucket name. Defaults to mabroka-ci-cache.
+    description: S3 bucket name.
     required: false
     default: mabroka-ci-cache
   region:
-    description: AWS region. Defaults to us-east-1.
+    description: AWS region.
     required: false
     default: us-east-1
   key-prefix:
-    description: Extra prefix for cache key (e.g. repo name).
+    description: Extra prefix for cache key.
     required: false
     default: ${{ github.repository }}
   shared-key:
-    description: Override key (skips Cargo.lock hash). Use when you want a single cache across branches.
+    description: Override key (skips Cargo.lock hash) — use for a single cache across branches.
     required: false
     default: ""
 
@@ -27,6 +27,12 @@ outputs:
   cache-hit:
     description: "true if cache was restored, false otherwise"
     value: ${{ steps.restore.outputs.cache-hit }}
+  key:
+    description: "The full S3 key used (so save can match)"
+    value: ${{ steps.key.outputs.key }}
+  workspace-abs:
+    description: "Resolved absolute path to workspace"
+    value: ${{ steps.key.outputs.workspace-abs }}
 
 runs:
   using: composite
@@ -59,7 +65,8 @@ runs:
       run: |
         set -euo pipefail
         command -v zstd >/dev/null || sudo dnf install -y zstd >/dev/null 2>&1 || sudo apt-get install -y zstd >/dev/null 2>&1
-        mkdir -p "${WORKSPACE_ABS}/target" "${HOME}/.cargo/registry" "${HOME}/.cargo/git"
+        CARGO_ROOT="${CARGO_HOME:-$HOME/.cargo}"
+        mkdir -p "${WORKSPACE_ABS}/target" "${CARGO_ROOT}/registry" "${CARGO_ROOT}/git"
         if aws s3api head-object --bucket "${BUCKET}" --key "${KEY}.tar.zst" >/dev/null 2>&1; then
           SIZE=$(aws s3api head-object --bucket "${BUCKET}" --key "${KEY}.tar.zst" --query ContentLength --output text)
           echo "cache HIT: s3://${BUCKET}/${KEY}.tar.zst (${SIZE} bytes)"
@@ -71,32 +78,3 @@ runs:
           echo "cache MISS: s3://${BUCKET}/${KEY}.tar.zst"
           echo "cache-hit=false" >> "$GITHUB_OUTPUT"
         fi
-
-    - name: Save cache to S3
-      if: always()
-      shell: bash
-      env:
-        AWS_DEFAULT_REGION: ${{ inputs.region }}
-        BUCKET: ${{ inputs.bucket }}
-        KEY: ${{ steps.key.outputs.key }}
-        WORKSPACE_ABS: ${{ steps.key.outputs.workspace-abs }}
-        CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
-      run: |
-        set -euo pipefail
-        if [[ "${CACHE_HIT}" == "true" ]] && [[ -z "${{ inputs.shared-key }}" ]]; then
-          echo "cache already populated for key ${KEY}, skipping save"
-          exit 0
-        fi
-        PATHS=()
-        [[ -d "${WORKSPACE_ABS}/target" ]] && PATHS+=("${WORKSPACE_ABS}/target")
-        [[ -d "${HOME}/.cargo/registry" ]] && PATHS+=("${HOME}/.cargo/registry")
-        [[ -d "${HOME}/.cargo/git" ]] && PATHS+=("${HOME}/.cargo/git")
-        if [[ ${#PATHS[@]} -eq 0 ]]; then
-          echo "no cache paths found, skipping save"
-          exit 0
-        fi
-        echo "saving: ${PATHS[*]}"
-        tar -cf - "${PATHS[@]}" \
-          | zstd -3 --long=27 -T0 \
-          | aws s3 cp - "s3://${BUCKET}/${KEY}.tar.zst" --no-progress --expected-size 5000000000
-        echo "cache saved: s3://${BUCKET}/${KEY}.tar.zst"

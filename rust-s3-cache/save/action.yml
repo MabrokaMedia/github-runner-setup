@@ -1,0 +1,67 @@
+name: Rust S3 cache (save)
+description: Upload cargo registry + target/ to same-region S3. Pair with rust-s3-cache/restore.
+author: MabrokaMedia
+
+inputs:
+  workspace:
+    description: Path to the cargo workspace (must match the restore step).
+    required: true
+  bucket:
+    description: S3 bucket name.
+    required: false
+    default: mabroka-ci-cache
+  region:
+    description: AWS region.
+    required: false
+    default: us-east-1
+  key-prefix:
+    description: Extra prefix for cache key (must match the restore step).
+    required: false
+    default: ${{ github.repository }}
+  shared-key:
+    description: Override key (must match the restore step).
+    required: false
+    default: ""
+  cache-hit:
+    description: Output from the restore step. If "true" and shared-key is empty, save is skipped.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Save cache to S3
+      shell: bash
+      env:
+        AWS_DEFAULT_REGION: ${{ inputs.region }}
+        BUCKET: ${{ inputs.bucket }}
+      run: |
+        set -euo pipefail
+        WORKSPACE_ABS="$(cd "${{ inputs.workspace }}" && pwd)"
+        if [[ -n "${{ inputs.shared-key }}" ]]; then
+          KEY="${{ inputs.key-prefix }}/${{ inputs.shared-key }}"
+        else
+          HASH=$(find "${WORKSPACE_ABS}" -name Cargo.lock -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 | head -c 16)
+          KEY="${{ inputs.key-prefix }}/rust/${HASH}"
+        fi
+        echo "cache key: ${KEY}"
+        if [[ "${{ inputs.cache-hit }}" == "true" ]] && [[ -z "${{ inputs.shared-key }}" ]]; then
+          echo "cache already populated (cache-hit=true), skipping save"
+          exit 0
+        fi
+        command -v zstd >/dev/null || sudo dnf install -y zstd >/dev/null 2>&1 || sudo apt-get install -y zstd >/dev/null 2>&1
+        CARGO_ROOT="${CARGO_HOME:-$HOME/.cargo}"
+        PATHS=()
+        [[ -d "${WORKSPACE_ABS}/target" ]] && PATHS+=("${WORKSPACE_ABS}/target")
+        [[ -d "${CARGO_ROOT}/registry" ]] && PATHS+=("${CARGO_ROOT}/registry")
+        [[ -d "${CARGO_ROOT}/git" ]] && PATHS+=("${CARGO_ROOT}/git")
+        if [[ ${#PATHS[@]} -eq 0 ]]; then
+          echo "no cache paths found, skipping save"
+          exit 0
+        fi
+        echo "saving: ${PATHS[*]}"
+        du -sh "${PATHS[@]}" 2>/dev/null || true
+        tar -cf - "${PATHS[@]}" \
+          | zstd -3 --long=27 -T0 \
+          | aws s3 cp - "s3://${BUCKET}/${KEY}.tar.zst" --no-progress --expected-size 5000000000
+        echo "cache saved: s3://${BUCKET}/${KEY}.tar.zst"
