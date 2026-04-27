@@ -49,7 +49,13 @@ exec > /var/log/ami-builder.log 2>&1
 
 echo "=== installing deps ==="
 dnf update -y
-dnf install -y git docker jq libicu tar gzip zstd
+# `lld` is the LLVM linker; rust workflows that opt in via
+# `RUSTFLAGS=-C link-arg=-fuse-ld=lld` save ~1-2 min on the link
+# phase of large release builds (e.g. cargo lambda build with 23+
+# release-mode binaries). Baking it in removes the per-job
+# `dnf install lld` overhead and makes the linker reliably present
+# on every fresh runner spawn.
+dnf install -y git docker jq libicu tar gzip zstd lld
 
 echo "=== docker ==="
 systemctl enable docker
