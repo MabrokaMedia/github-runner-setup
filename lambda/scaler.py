@@ -3,8 +3,9 @@ Lambda function: GitHub Actions Runner Auto-Scaler
 Receives workflow_job webhooks from GitHub, scales the appropriate ASG up for queued jobs.
 
 Routes by label:
-  - label "small" -> gh-runner-small-asg (c7g.large tier)
-  - else         -> gh-runner-asg       (c7g.2xlarge tier)
+  - label "stable" -> gh-runner-stable-asg (c7g.2xlarge on-demand — long deploys/builds)
+  - label "small"  -> gh-runner-small-asg  (c7g.large spot)
+  - else           -> gh-runner-asg        (c7g.2xlarge spot, default)
 """
 
 import json
@@ -18,6 +19,7 @@ ssm = boto3.client("ssm")
 
 FAST_ASG = os.environ.get("FAST_ASG_NAME", os.environ.get("ASG_NAME", "gh-runner-asg"))
 SMALL_ASG = os.environ.get("SMALL_ASG_NAME", "gh-runner-small-asg")
+STABLE_ASG = os.environ.get("STABLE_ASG_NAME", "gh-runner-stable-asg")
 MAX_RUNNERS = int(os.environ.get("MAX_RUNNERS", "10"))
 WEBHOOK_SECRET_PARAM = os.environ["WEBHOOK_SECRET_PARAM"]
 # Common discriminator labels our workflows set — if present, job is for our runners
@@ -36,6 +38,10 @@ def pick_asg(job_labels: set) -> str | None:
     # Must at least claim the base labels
     if not BASE_LABELS.issubset(job_labels):
         return None
+    # `stable` wins over `fast`/`small` if both are set, so a workflow can
+    # opt a single job up to on-demand without rewriting the rest.
+    if "stable" in job_labels:
+        return STABLE_ASG
     if "small" in job_labels:
         return SMALL_ASG
     if "fast" in job_labels:
@@ -88,7 +94,7 @@ def _schedule_retry():
 
 def handler(event, context):
     if event.get("_periodic_check") or event.get("_retry"):
-        for asg in (FAST_ASG, SMALL_ASG):
+        for asg in (FAST_ASG, SMALL_ASG, STABLE_ASG):
             try:
                 state = get_asg_state(asg)
                 if state["desired"] < MAX_RUNNERS:

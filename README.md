@@ -5,9 +5,10 @@ Scale-to-zero GitHub Actions self-hosted runners on AWS EC2 Spot (ARM64).
 ## What's here
 
 - `setup.sh` — provisions the initial stack (IAM, SG, launch template, ASG, Lambda webhook, API Gateway, GitHub org webhook, S3 cache bucket).
+- `add-stable-asg.sh` — adds the on-demand `stable` tier (idempotent; mirrors the fast LT minus spot, enables CapacityRebalance on the spot ASGs).
 - `build-ami.sh` — bakes a pre-installed AMI (OS deps + runner binary). Run this monthly to keep the AMI fresh.
 - `teardown.sh` — removes everything.
-- `lambda/scaler.py` — Lambda that routes `workflow_job queued` events to the right ASG by label (`small` → small tier, else → fast tier).
+- `lambda/scaler.py` — Lambda that routes `workflow_job queued` events to the right ASG by label (`stable` → stable tier, `small` → small tier, else → fast tier).
 - `rust-s3-cache/` — composite actions (`restore/` + `save/`) that replace `Swatinem/rust-cache@v2` with a same-region S3 cache.
 - `migrate-workflow.py` / `migrate-all.sh` — one-shot migration tooling used to roll out the S3 cache across existing workflows.
 
@@ -18,23 +19,29 @@ Scale-to-zero GitHub Actions self-hosted runners on AWS EC2 Spot (ARM64).
           │
           ▼
   API Gateway → Lambda scaler.py
-          │                │
-   (label: small)   (label: fast / default)
-          │                │
-          ▼                ▼
-   gh-runner-small-asg   gh-runner-asg
-   c7g/c6g/m6g/t4g       c7g/c6g/m7g/m6g
-   .large (2 vCPU)       .2xlarge (8 vCPU)
-   40 GB gp3             80 GB gp3
+          │              │              │
+   (label: small) (label: stable) (label: fast / default)
+          │              │              │
+          ▼              ▼              ▼
+  gh-runner-small-asg  gh-runner-stable-asg  gh-runner-asg
+  c7g/c6g/m6g/t4g      c7g.2xlarge           c7g/c6g/m7g/m6g
+  .large (2 vCPU)      8 vCPU                .2xlarge (8 vCPU)
+  40 GB gp3            80 GB gp3             80 GB gp3
+  spot                 ON-DEMAND             spot
 ```
 
-Both ASGs use **MixedInstancesPolicy** with `price-capacity-optimized` spot allocation so the scheduler picks the cheapest ARM64 pool available. Instances are `--ephemeral` — one job per runner, then self-terminate and decrement desired capacity.
+The `fast` and `small` ASGs use **MixedInstancesPolicy** with `price-capacity-optimized` spot allocation so the scheduler picks the cheapest ARM64 pool available. Instances are `--ephemeral` — one job per runner, then self-terminate and decrement desired capacity.
+
+The `stable` ASG is **100% on-demand** — same instance shape as `fast`, no spot. It exists for jobs whose cancellation cost outweighs the ~5x price premium (long `cargo lambda build`, mid-deploy CFN change-sets — anything where a 30-min build getting reclaimed at minute 25 forces a full restart). Spot-eviction telemetry on 2026-04-30 motivated the split: three davoxi-backend deploys hit `BidEvictedEvent` mid-build/deploy in a single afternoon despite the 4-pool spot diversification, because `setup.sh` pins the ASG to a single AZ (intentional for ephemeral runners) and AZ-correlated capacity events still hit all four pools at once.
 
 ## Usage in workflows
 
 ```yaml
 # big Rust compilation — clippy, test, cargo lambda build
 runs-on: [self-hosted, linux, arm64, fast]
+
+# long-running deploys / builds where mid-flight cancellation hurts
+runs-on: [self-hosted, linux, arm64, stable]
 
 # trivial jobs — fmt, small-proxy test
 runs-on: [self-hosted, linux, arm64, small]
