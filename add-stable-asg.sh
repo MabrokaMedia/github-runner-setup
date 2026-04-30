@@ -57,8 +57,23 @@ FAST_LT_DATA=$(aws ec2 describe-launch-template-versions \
     --query 'LaunchTemplateVersions[0].LaunchTemplateData' \
     --output json) || err "Fast LT $FAST_LT not found — run setup.sh first"
 
-# Strip spot config, keep everything else (AMI, instance profile, SG, user data, EBS, tags)
-STABLE_LT_DATA=$(echo "$FAST_LT_DATA" | jq 'del(.InstanceMarketOptions)')
+# Re-label the user-data: the fast LT bakes `--labels …,fast` into config.sh
+# at instance boot. Cloning the user-data verbatim would make new stable-ASG
+# instances register as `fast` runners and pick up fast jobs — defeating the
+# routing. Decode → sed swap → re-encode.
+FAST_USER_DATA=$(echo "$FAST_LT_DATA" | jq -r '.UserData' | tr -d '\r' | base64 -d)
+STABLE_USER_DATA=$(echo "$FAST_USER_DATA" | sed 's/--labels self-hosted,linux,arm64,fast/--labels self-hosted,linux,arm64,stable/')
+if ! diff <(echo "$FAST_USER_DATA") <(echo "$STABLE_USER_DATA") >/dev/null; then
+    log "Re-labeled user-data: fast → stable"
+else
+    err "Label swap didn't match — fast LT user-data may have changed shape. Inspect manually."
+fi
+STABLE_USER_DATA_B64=$(echo "$STABLE_USER_DATA" | base64 -w 0)
+
+# Strip spot config + swap user-data; keep everything else (AMI, instance
+# profile, SG, EBS, tags) byte-for-byte identical.
+STABLE_LT_DATA=$(echo "$FAST_LT_DATA" \
+    | jq --arg ud "$STABLE_USER_DATA_B64" 'del(.InstanceMarketOptions) | .UserData = $ud')
 log "Mirrored fast LT, removed InstanceMarketOptions (becomes on-demand)"
 
 # ─── STEP 2: Create or update stable launch template ────────────────────────
@@ -67,9 +82,13 @@ echo "════════════════════════�
 echo " STEP 2: Stable launch template"
 echo "═══════════════════════════════════════════════════════════════"
 
+# Use --query so AWS CLI exits 0 even when the LT doesn't exist (avoids
+# pipefail killing the script on first run).
 STABLE_LT_EXISTS=$(aws ec2 describe-launch-templates \
-    --launch-template-names "$STABLE_LT" \
-    --region "$AWS_REGION" 2>/dev/null | jq -r '.LaunchTemplates | length')
+    --filters "Name=launch-template-name,Values=$STABLE_LT" \
+    --region "$AWS_REGION" \
+    --query 'LaunchTemplates | length(@)' \
+    --output text)
 
 if [[ "$STABLE_LT_EXISTS" -gt 0 ]]; then
     aws ec2 create-launch-template-version \
@@ -171,11 +190,23 @@ CURRENT_ENV=$(aws lambda get-function-configuration \
     --query 'Environment.Variables' \
     --output json) || err "Lambda $LAMBDA_NAME not found"
 
-NEW_ENV=$(echo "$CURRENT_ENV" | jq --arg v "$STABLE_ASG" '. + {STABLE_ASG_NAME: $v}')
+# Build the shorthand `Variables={K=v,K2=v2,...}` form. We avoid JSON-via-file
+# because on Git-Bash/MSYS2 the native Windows AWS CLI can't read POSIX paths
+# returned by mktemp. Shorthand is fine here — none of the values contain
+# `,` or `=`. If a future env var does, switch to writing JSON to a Windows
+# path (e.g. cygpath -w "$file") and use --environment file://<winpath>.
+ENV_SHORTHAND=$(echo "$CURRENT_ENV" \
+    | jq --arg v "$STABLE_ASG" -r '
+        (. + {STABLE_ASG_NAME: $v})
+        | to_entries
+        | map("\(.key)=\(.value|tostring)")
+        | join(",")
+        | "Variables={" + . + "}"
+    ')
 
 aws lambda update-function-configuration \
     --function-name "$LAMBDA_NAME" \
-    --environment "Variables=$(echo "$NEW_ENV" | jq -c .)" \
+    --environment "$ENV_SHORTHAND" \
     --region "$AWS_REGION" >/dev/null
 log "Lambda $LAMBDA_NAME env updated: STABLE_ASG_NAME=$STABLE_ASG"
 
