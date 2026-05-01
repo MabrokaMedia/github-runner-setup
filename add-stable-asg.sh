@@ -60,12 +60,29 @@ echo "════════════════════════�
 echo " STEP 1: Read fast launch template (mirror config)"
 echo "═══════════════════════════════════════════════════════════════"
 
+# Source the LT version the FAST ASG is actually running, not `$Latest`.
+# Reason: on 2026-05-01 the prod fast ASG was pinned to v18 (working AMI
+# `ami-028f3f080eda659c5`, runner binary pre-baked at /home/runner) while
+# v19 was a half-baked AMI upgrade (`ami-0dd9b3d287933ff67` — runner not
+# installed) that nobody promoted. Pulling `$Latest` got v19, which made
+# every stable-tier launch register-fail and die at the 5-min watchdog
+# without ever picking up the queued job. The fast ASG is the ground
+# truth — whatever AMI/user-data IT runs is the one that's known-good.
+FAST_LT_VERSION=$(aws autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$FAST_ASG" \
+    --region "$AWS_REGION" \
+    --query 'AutoScalingGroups[0].MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.Version
+             || AutoScalingGroups[0].LaunchTemplate.Version' \
+    --output text)
+[[ -z "$FAST_LT_VERSION" || "$FAST_LT_VERSION" == "None" ]] && err "Could not read fast ASG's LT version — is gh-runner-asg provisioned?"
+log "Sourcing from fast LT version $FAST_LT_VERSION (the version the live fast ASG actually uses)"
+
 FAST_LT_DATA=$(aws ec2 describe-launch-template-versions \
     --launch-template-name "$FAST_LT" \
-    --versions '$Latest' \
+    --versions "$FAST_LT_VERSION" \
     --region "$AWS_REGION" \
     --query 'LaunchTemplateVersions[0].LaunchTemplateData' \
-    --output json) || err "Fast LT $FAST_LT not found — run setup.sh first"
+    --output json) || err "Fast LT $FAST_LT version $FAST_LT_VERSION not found"
 
 # Re-label the user-data: the fast LT bakes `--labels …,fast` into config.sh
 # at instance boot. Cloning the user-data verbatim would make new stable-ASG
