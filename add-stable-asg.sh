@@ -1,6 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+# Disable MSYS2/Git-Bash POSIX→Windows path translation. On Windows, Git-Bash
+# rewrites any CLI argument starting with `/` to a Windows path before the
+# child process sees it — so passing `WEBHOOK_SECRET_PARAM=/gh-runner/webhook-secret`
+# to the Windows AWS CLI silently became `WEBHOOK_SECRET_PARAM=C:/Program Files/Git/gh-runner/webhook-secret`,
+# which broke every webhook for ~10h on 2026-04-30. Belt and braces: also
+# export MSYS2_ARG_CONV_EXCL='*' so any env shorthand we build never triggers
+# the conversion. Both vars are no-ops on Linux/macOS.
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL='*'
+
 # =============================================================================
 # Add a third runner tier: gh-runner-stable-asg (100% on-demand)
 # =============================================================================
