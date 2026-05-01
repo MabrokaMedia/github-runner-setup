@@ -28,7 +28,8 @@ export MSYS2_ARG_CONV_EXCL='*'
 #     - Lambda env updated with STABLE_ASG_NAME
 #
 # Usage:
-#   AWS_REGION=us-east-1 bash add-stable-asg.sh
+#   AWS_REGION=us-east-1 bash add-stable-asg.sh                 # provision + cheap sanity check
+#   AWS_REGION=us-east-1 bash add-stable-asg.sh --smoke-test    # also do a launch-based smoke test
 #
 # Idempotent: re-running updates the launch template + ASG min/max + Lambda
 # env, never duplicates resources.
@@ -42,6 +43,19 @@ STABLE_ASG="${PREFIX}-stable-asg"
 STABLE_LT="${PREFIX}-stable-lt"
 LAMBDA_NAME="${PREFIX}-scaler"
 MAX_RUNNERS="${MAX_RUNNERS:-10}"
+
+# Parse flags
+SMOKE_TEST=0
+for arg in "$@"; do
+    case "$arg" in
+        --smoke-test) SMOKE_TEST=1 ;;
+        --help|-h)
+            sed -n '14,35p' "$0"
+            exit 0
+            ;;
+        *) echo "Unknown flag: $arg" >&2; exit 2 ;;
+    esac
+done
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[✓]${NC} $1"; }
@@ -241,6 +255,199 @@ warn "NOTE: also deploy the updated lambda/scaler.py — env alone won't route t
 warn "      cd lambda && zip -j /tmp/scaler.zip scaler.py && \\"
 warn "      aws lambda update-function-code --function-name $LAMBDA_NAME \\"
 warn "        --zip-file fileb:///tmp/scaler.zip --region $AWS_REGION"
+
+# ─── STEP 7: Sanity check (always runs, no instance launch) ─────────────────
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo " STEP 7: Sanity check (config integrity)"
+echo "═══════════════════════════════════════════════════════════════"
+
+# (1) AMI must match the one fast ASG actually runs. Catches the 2026-05-01
+#     bug where this script sourced fast LT $Latest (broken AMI v19) instead
+#     of the version the fast ASG was pinned to (working v18). PR #5 fixed
+#     the source, this check guards the result.
+EXPECTED_AMI=$(echo "$FAST_LT_DATA" | jq -r '.ImageId')
+ACTUAL_AMI=$(aws ec2 describe-launch-template-versions \
+    --launch-template-name "$STABLE_LT" \
+    --versions '$Latest' \
+    --region "$AWS_REGION" \
+    --query 'LaunchTemplateVersions[0].LaunchTemplateData.ImageId' \
+    --output text | tr -d '\r')
+if [[ "$EXPECTED_AMI" != "$ACTUAL_AMI" ]]; then
+    err "AMI mismatch — stable LT has $ACTUAL_AMI, fast ASG runs $EXPECTED_AMI"
+fi
+log "AMI matches fast ASG: $ACTUAL_AMI"
+
+# (2) AMI must be in `available` state. Catches "AMI was deleted/deprecated
+#     after the fast ASG was provisioned but before stable was added".
+AMI_STATE=$(aws ec2 describe-images --image-ids "$ACTUAL_AMI" --region "$AWS_REGION" \
+    --query 'Images[0].State' --output text 2>/dev/null || echo "missing")
+if [[ "$AMI_STATE" != "available" ]]; then
+    err "AMI $ACTUAL_AMI is in state '$AMI_STATE' (expected 'available'). New launches will fail."
+fi
+log "AMI is available"
+
+# (3) User-data carries the `stable` label. Catches sed-substitution failure
+#     (which would silently make stable instances register as fast runners).
+STABLE_UD_VERIFY=$(aws ec2 describe-launch-template-versions \
+    --launch-template-name "$STABLE_LT" \
+    --versions '$Latest' \
+    --region "$AWS_REGION" \
+    --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
+    --output text | tr -d '\r' | base64 -d)
+if ! echo "$STABLE_UD_VERIFY" | grep -q "labels self-hosted,linux,arm64,stable"; then
+    err "user-data missing 'stable' label — sed swap failed. Inspect manually."
+fi
+if echo "$STABLE_UD_VERIFY" | grep -q "labels self-hosted,linux,arm64,fast"; then
+    err "user-data still has 'fast' label after sed swap. Inspect manually."
+fi
+log "user-data carries 'stable' label only (no leftover 'fast')"
+
+# ─── STEP 8: Optional launch-based smoke test (--smoke-test) ────────────────
+if [[ "$SMOKE_TEST" -eq 1 ]]; then
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo " STEP 8: Smoke test (launches one runner to verify end-to-end)"
+    echo "═══════════════════════════════════════════════════════════════"
+
+    # Refuse to smoke if there's any in-flight stable work. The cleanup
+    # trap scales ASG to 0 unconditionally — running smoke on top of a
+    # live build would kill it. Run smoke only during quiet windows.
+    EXISTING_DESIRED=$(aws autoscaling describe-auto-scaling-groups \
+        --auto-scaling-group-names "$STABLE_ASG" \
+        --region "$AWS_REGION" \
+        --query 'AutoScalingGroups[0].DesiredCapacity' \
+        --output text)
+    EXISTING_INSTS=$(aws autoscaling describe-auto-scaling-groups \
+        --auto-scaling-group-names "$STABLE_ASG" \
+        --region "$AWS_REGION" \
+        --query 'length(AutoScalingGroups[0].Instances)' \
+        --output text)
+    if [[ "$EXISTING_DESIRED" -gt 0 || "$EXISTING_INSTS" -gt 0 ]]; then
+        err "Refusing to smoke: $STABLE_ASG has desired=$EXISTING_DESIRED, instances=$EXISTING_INSTS. Wait for stable runners to finish, then re-run."
+    fi
+    log "Stable ASG is quiet (desired=0, no instances) — safe to smoke"
+
+    # We need to read user-data trace from EC2 console output, but the
+    # production user-data redirects everything to a file (`exec >
+    # /var/log/runner-setup.log 2>&1`). Trick: create a temporary LT
+    # version that swaps that redirect for `tee /dev/console` so the
+    # `set -x` trace shows up in the EC2 console. We run the smoke
+    # against that version, then restore the previous default.
+    #
+    # Cleanup-on-exit trap: ALWAYS restore the previous default version
+    # and scale the ASG back to 0, even on Ctrl-C / shell errors. The
+    # smoke version is left in place (cheap, useful for debugging).
+    PREV_DEFAULT=$(aws ec2 describe-launch-templates \
+        --launch-template-names "$STABLE_LT" \
+        --region "$AWS_REGION" \
+        --query 'LaunchTemplates[0].DefaultVersionNumber' \
+        --output text)
+    SMOKE_LT_DATA=$(echo "$STABLE_LT_DATA" | jq --arg ud \
+        "$(echo "$STABLE_USER_DATA" \
+            | sed 's|^exec > /var/log/runner-setup.log 2>&1$|exec > >(tee -a /var/log/runner-setup.log /dev/console) 2>\&1|' \
+            | base64 -w 0)" \
+        '.UserData = $ud')
+    SMOKE_FILE="$(mktemp -t smoke-lt-XXXX.json)"
+    # Convert POSIX path → Windows for AWS CLI (Git-Bash compatibility)
+    if command -v cygpath >/dev/null 2>&1; then
+        SMOKE_FILE_WIN=$(cygpath -w "$SMOKE_FILE")
+    else
+        SMOKE_FILE_WIN="$SMOKE_FILE"
+    fi
+    echo "$SMOKE_LT_DATA" > "$SMOKE_FILE"
+    SMOKE_VERSION=$(aws ec2 create-launch-template-version \
+        --launch-template-name "$STABLE_LT" \
+        --source-version '$Latest' \
+        --launch-template-data "file://$SMOKE_FILE_WIN" \
+        --version-description "smoke-test (console redirect for diagnostics)" \
+        --region "$AWS_REGION" \
+        --query 'LaunchTemplateVersion.VersionNumber' \
+        --output text)
+    rm -f "$SMOKE_FILE"
+    log "Smoke LT version: $SMOKE_VERSION (will be restored to v$PREV_DEFAULT after smoke)"
+
+    # Cleanup trap fires on any exit path (success, error, signal).
+    # Order matters: scale-down first, then restore default version.
+    cleanup_smoke() {
+        local exit_code=$?
+        echo ""
+        warn "Smoke cleanup (exit_code=$exit_code)..."
+        aws autoscaling set-desired-capacity \
+            --auto-scaling-group-name "$STABLE_ASG" \
+            --desired-capacity 0 \
+            --region "$AWS_REGION" 2>/dev/null || true
+        aws ec2 modify-launch-template \
+            --launch-template-name "$STABLE_LT" \
+            --default-version "$PREV_DEFAULT" \
+            --region "$AWS_REGION" >/dev/null 2>&1 || true
+        log "Smoke cleanup done (ASG scaled to 0, default version restored to v$PREV_DEFAULT)"
+    }
+    trap cleanup_smoke EXIT
+
+    # Promote the smoke version to default and scale up
+    aws ec2 modify-launch-template \
+        --launch-template-name "$STABLE_LT" \
+        --default-version "$SMOKE_VERSION" \
+        --region "$AWS_REGION" >/dev/null
+    aws autoscaling set-desired-capacity \
+        --auto-scaling-group-name "$STABLE_ASG" \
+        --desired-capacity 1 \
+        --region "$AWS_REGION"
+    log "Smoke ASG scaled to 1, waiting for InService..."
+
+    # Wait up to 3 min for InService instance
+    SMOKE_INST=""
+    for _ in $(seq 1 36); do
+        SMOKE_INST=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$STABLE_ASG" \
+            --region "$AWS_REGION" \
+            --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+            --output text 2>/dev/null | tr -d '\r')
+        [[ -n "$SMOKE_INST" ]] && break
+        sleep 5
+    done
+    [[ -z "$SMOKE_INST" ]] && err "Smoke: no InService instance after 3 min"
+    log "Smoke instance: $SMOKE_INST"
+
+    # Wait up to 3 min for user-data to finish + console output to populate.
+    # Success markers (in priority order): "Settings Saved" (config.sh),
+    # "/usr/local/bin/idle-watchdog.sh" (last command in user-data).
+    # Failure markers: "config.sh: No such file or directory" (broken AMI),
+    # "Authentication failed" (PAT issue).
+    SMOKE_RESULT=""
+    for _ in $(seq 1 36); do
+        sleep 5
+        OUT=$(aws ec2 get-console-output \
+            --instance-id "$SMOKE_INST" \
+            --latest \
+            --region "$AWS_REGION" \
+            --query 'Output' --output text 2>/dev/null || true)
+        if echo "$OUT" | grep -qE "config\.sh: No such file|svc\.sh: No such file"; then
+            SMOKE_RESULT="FAIL: runner binary missing on AMI ($EXPECTED_AMI)"
+            break
+        fi
+        if echo "$OUT" | grep -qE "Http response code: Unauthorized|Authentication failed"; then
+            SMOKE_RESULT="FAIL: GitHub PAT in /gh-runner/github-pat is invalid or expired"
+            break
+        fi
+        if echo "$OUT" | grep -q "Settings Saved\."; then
+            SMOKE_RESULT="PASS: runner registered with GitHub (config.sh succeeded)"
+            break
+        fi
+    done
+
+    if [[ -z "$SMOKE_RESULT" ]]; then
+        SMOKE_RESULT="INCONCLUSIVE: 3 min elapsed, no success or failure marker on console — check $SMOKE_INST manually"
+    fi
+
+    if [[ "$SMOKE_RESULT" == PASS:* ]]; then
+        log "Smoke: $SMOKE_RESULT"
+    else
+        err "Smoke: $SMOKE_RESULT"
+    fi
+    # cleanup_smoke trap runs on exit
+fi
 
 # ─── DONE ────────────────────────────────────────────────────────────────────
 echo ""
