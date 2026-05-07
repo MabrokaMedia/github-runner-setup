@@ -114,7 +114,11 @@ runs:
         fi
 
         # Promote: server-side copy staging → canonical (atomic from any reader's POV).
+        # `--copy-props none` skips tag/metadata preservation — without it, `aws s3 cp` calls
+        # GetObjectTagging on the source, which the gh-runner-ec2-role IAM does NOT permit
+        # (we don't tag cache objects, so this is purely overhead). Found via 2026-05-07
+        # cache-miss runs on davoxi-stripe-identity-business and davoxi-calendar-business.
         # Then drop the staging key. The trap also has a fallback delete just in case.
-        aws s3 cp "s3://${BUCKET}/${STAGING_KEY}" "s3://${BUCKET}/${KEY}.tar.zst" --no-progress
+        aws s3 cp "s3://${BUCKET}/${STAGING_KEY}" "s3://${BUCKET}/${KEY}.tar.zst" --copy-props none --no-progress
         aws s3 rm "s3://${BUCKET}/${STAGING_KEY}" --no-progress
         echo "cache saved: s3://${BUCKET}/${KEY}.tar.zst"
