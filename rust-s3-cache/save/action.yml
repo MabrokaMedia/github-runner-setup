@@ -74,7 +74,47 @@ runs:
         fi
         echo "saving: ${PATHS[*]}"
         du -sh "${PATHS[@]}" 2>/dev/null || true
-        tar -cf - "${PATHS[@]}" \
+
+        # ----- Atomic upload via staging key -----
+        # We never overwrite the canonical key directly. Stream tar|zstd to a per-run staging
+        # key, then promote (server-side copy) ONLY if tar's stderr is free of concurrent-
+        # modification warnings. If anything looks off, the staging blob is deleted and the
+        # canonical cache stays untouched. Worst case: a save is lost; cache is never poisoned.
+        STAGING_KEY="${KEY}.staging-${GITHUB_RUN_ID:-noid}-${GITHUB_RUN_ATTEMPT:-1}-${GITHUB_JOB:-job}.tar.zst"
+        TAR_STDERR="$(mktemp)"
+        # Always clean up the temp file and any leaked staging blob on exit.
+        trap '
+          rm -f "${TAR_STDERR}"
+          aws s3api head-object --bucket "${BUCKET}" --key "${STAGING_KEY}" >/dev/null 2>&1 \
+            && aws s3 rm "s3://${BUCKET}/${STAGING_KEY}" --no-progress >/dev/null 2>&1 || true
+        ' EXIT
+
+        # Pipefail makes any stage failure (tar/zstd/aws) propagate. tar warnings go to stderr
+        # and DO NOT affect exit code by default — we grep the captured stderr separately.
+        tar -cf - "${PATHS[@]}" 2>"${TAR_STDERR}" \
           | zstd -3 --long=27 -T0 \
-          | aws s3 cp - "s3://${BUCKET}/${KEY}.tar.zst" --no-progress --expected-size 5000000000
+          | aws s3 cp - "s3://${BUCKET}/${STAGING_KEY}" --no-progress --expected-size 5000000000
+
+        # Surface tar's stderr verbatim so it shows up in the job log.
+        if [[ -s "${TAR_STDERR}" ]]; then
+          echo "----- tar stderr -----"
+          cat "${TAR_STDERR}"
+          echo "----- end tar stderr -----"
+        fi
+
+        # Concurrent-modification warnings mean another process was writing to the registry
+        # while tar was reading it. The resulting archive can have inconsistent hardlink dedup
+        # tables (e.g. `.cargo-ok` linked to a `.der` from a different crate) — exactly the
+        # 2026-05-07 incident. Refuse to promote a tainted blob.
+        if grep -E -q "file changed as we read it|file shrank by|File removed before we read it" "${TAR_STDERR}"; then
+          echo "ERROR: tar detected concurrent registry modification. Local archive is not"
+          echo "       internally consistent and was NOT promoted to the canonical cache key."
+          echo "       Discarding staging blob. The canonical cache remains untouched."
+          exit 1
+        fi
+
+        # Promote: server-side copy staging → canonical (atomic from any reader's POV).
+        # Then drop the staging key. The trap also has a fallback delete just in case.
+        aws s3 cp "s3://${BUCKET}/${STAGING_KEY}" "s3://${BUCKET}/${KEY}.tar.zst" --no-progress
+        aws s3 rm "s3://${BUCKET}/${STAGING_KEY}" --no-progress
         echo "cache saved: s3://${BUCKET}/${KEY}.tar.zst"
