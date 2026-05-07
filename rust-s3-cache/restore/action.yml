@@ -64,6 +64,12 @@ runs:
         WORKSPACE_ABS: ${{ steps.key.outputs.workspace-abs }}
       run: |
         set -euo pipefail
+        # Sentinel lives in RUNNER_TEMP (per-job ephemeral, NOT inside CARGO_ROOT — putting it
+        # under the cached tree would let a partial restore leak a stale "MISS" value back in).
+        # Save reads this file and refuses to upload unless it says MISS, so a cancellation
+        # mid-`tar -xf` leaves no sentinel → save aborts → S3 cache stays clean.
+        STATE_FILE="${RUNNER_TEMP:-/tmp}/rust-s3-cache-state"
+        rm -f "${STATE_FILE}"
         command -v zstd >/dev/null || sudo dnf install -y zstd >/dev/null 2>&1 || sudo apt-get install -y zstd >/dev/null 2>&1
         CARGO_ROOT="${CARGO_HOME:-$HOME/.cargo}"
         mkdir -p "${WORKSPACE_ABS}/target" "${CARGO_ROOT}/registry" "${CARGO_ROOT}/git"
@@ -73,8 +79,12 @@ runs:
           aws s3 cp "s3://${BUCKET}/${KEY}.tar.zst" - --no-progress \
             | zstd -d --long=27 \
             | tar -xf - -C /
+          # Sentinel + cache-hit output written ONLY after tar fully succeeds. If the step is
+          # cancelled mid-extract, neither line runs, and save will see no sentinel.
+          echo HIT-COMPLETE > "${STATE_FILE}"
           echo "cache-hit=true" >> "$GITHUB_OUTPUT"
         else
           echo "cache MISS: s3://${BUCKET}/${KEY}.tar.zst"
+          echo MISS > "${STATE_FILE}"
           echo "cache-hit=false" >> "$GITHUB_OUTPUT"
         fi
