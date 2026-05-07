@@ -34,6 +34,29 @@ runs:
       run: |
         set -euo pipefail
         echo "cache key: ${KEY}"
+        # The matching restore step writes a sentinel to RUNNER_TEMP after its tar/branch fully
+        # succeeds. We refuse to save unless that sentinel says MISS. If restore was cancelled
+        # mid-`tar -xf`, the sentinel is absent — saving anyway would tar a half-extracted
+        # registry whose hardlink dedup table is inconsistent, producing a poison archive
+        # whose `.cargo-ok` files end up linked to unrelated binary content (e.g. .der files).
+        # Every subsequent restorer of that key then fails with
+        # `unable to read .cargo-ok ... stream did not contain valid UTF-8`.
+        STATE_FILE="${RUNNER_TEMP:-/tmp}/rust-s3-cache-state"
+        STATE="$(cat "${STATE_FILE}" 2>/dev/null || echo MISSING)"
+        case "${STATE}" in
+          MISS)
+            echo "restore confirmed cache miss; proceeding with save"
+            ;;
+          HIT-COMPLETE)
+            echo "restore was a cache hit; cache already populated, skipping save"
+            exit 0
+            ;;
+          *)
+            echo "restore-state='${STATE}' (expected MISS or HIT-COMPLETE) — restore was interrupted, never ran, or the sentinel was clobbered. Skipping save to avoid uploading an inconsistent registry."
+            exit 0
+            ;;
+        esac
+        # Back-compat short-circuit: callers may still pass cache-hit explicitly.
         if [[ "${{ inputs.cache-hit }}" == "true" ]]; then
           echo "cache already populated (cache-hit=true), skipping save"
           exit 0
