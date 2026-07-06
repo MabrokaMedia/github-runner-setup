@@ -1,0 +1,42 @@
+name: Add ACM validation CNAME (davoxi.com)
+
+# One-shot migration helper: adds the AWS ACM DNS-validation CNAME for the
+# davoxi.com certificate in the NEW AWS account (447393542383) to the
+# Cloudflare zone. Runs here because this public repo receives the org-level
+# CLOUDFLARE_API_TOKEN secret. The record content is public DNS by nature.
+
+on:
+  push:
+    branches: [migrate-aws-dns]
+
+jobs:
+  add-record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Upsert validation CNAME
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NAME: _8fbb536c22c06da1ce0e6a4d0e68a1ec.davoxi.com
+          CONTENT: _b621a0de29dab011dc5a9855e57b614b.jkddzztszm.acm-validations.aws
+        run: |
+          set -euo pipefail
+          if [ -z "$CF_TOKEN" ]; then echo "::error::CLOUDFLARE_API_TOKEN not injected"; exit 1; fi
+          ZONE=$(curl -fsS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones?name=davoxi.com" | \
+            python3 -c "import json,sys; print(json.load(sys.stdin)['result'][0]['id'])")
+          echo "zone=$ZONE"
+          EXISTING=$(curl -fsS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/$ZONE/dns_records?name=$NAME" | \
+            python3 -c "import json,sys; r=json.load(sys.stdin)['result']; print(r[0]['id'] if r else '')")
+          BODY=$(printf '{"type":"CNAME","name":"%s","content":"%s","ttl":300,"proxied":false}' "$NAME" "$CONTENT")
+          if [ -n "$EXISTING" ]; then
+            curl -fsS -X PUT -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" \
+              -d "$BODY" "https://api.cloudflare.com/client/v4/zones/$ZONE/dns_records/$EXISTING" > /dev/null
+            echo "updated existing record"
+          else
+            curl -fsS -X POST -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" \
+              -d "$BODY" "https://api.cloudflare.com/client/v4/zones/$ZONE/dns_records" > /dev/null
+            echo "created record"
+          fi
+          echo "done — ACM will validate within minutes"
