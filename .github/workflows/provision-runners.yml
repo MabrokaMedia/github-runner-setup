@@ -1,0 +1,82 @@
+name: Provision runner fleet (new AWS account)
+
+# Console-free migration of the self-hosted runner fleet to the NEW account
+# (447393542383). Uses the github-deploy OIDC role for AWS and DAVOXI_BACKEND_PAT
+# for GitHub org registration + webhook. Pre-seeds the PAT into SSM so setup.sh's
+# interactive prompt is skipped. Idempotent (setup.sh / add-stable-asg.sh both are).
+
+on:
+  push:
+    branches: [provision-runners]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  ORG_NAME: MabrokaMedia
+  ACCOUNT_ID: "447393542383"
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (new account OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::447393542383:role/github-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Preflight — verify PAT scopes
+        env:
+          GH_PAT: ${{ secrets.DAVOXI_BACKEND_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_PAT}" ]; then echo "::error::DAVOXI_BACKEND_PAT is empty"; exit 1; fi
+          SCOPES=$(curl -sSI -H "Authorization: token ${GH_PAT}" https://api.github.com/user \
+            | tr -d '\r' | awk -F': ' 'tolower($1)=="x-oauth-scopes"{print $2}')
+          echo "PAT scopes: ${SCOPES:-<none / fine-grained>}"
+          case "$SCOPES" in
+            *admin:org*) echo "has admin:org ✓";;
+            *) echo "::warning::PAT may lack admin:org — runner registration/webhook may fail. Continuing to provision AWS infra regardless.";;
+          esac
+
+      - name: Pre-seed PAT into SSM (skips setup.sh interactive prompt)
+        env:
+          GH_PAT: ${{ secrets.DAVOXI_BACKEND_PAT }}
+        run: |
+          set -euo pipefail
+          aws ssm put-parameter --name /gh-runner/github-pat --type SecureString \
+            --value "$GH_PAT" --overwrite --region "$AWS_REGION"
+          echo "PAT stored at /gh-runner/github-pat"
+
+      - name: Patch script config (ORG, region, account-scoped cache bucket)
+        run: |
+          set -euo pipefail
+          sed -i 's/^ORG_NAME=""/ORG_NAME="MabrokaMedia"/' setup.sh
+          sed -i 's/^AWS_REGION="us-east-2".*/AWS_REGION="us-east-2"/' setup.sh
+          sed -i 's/^CACHE_BUCKET="mabroka-ci-cache".*/CACHE_BUCKET="mabroka-ci-cache-447393542383"/' setup.sh
+          grep -E '^(ORG_NAME|AWS_REGION|CACHE_BUCKET)=' setup.sh
+
+      - name: Run setup.sh (fast tier + Lambda + API GW + org webhook)
+        env:
+          GH_TOKEN: ${{ secrets.DAVOXI_BACKEND_PAT }}
+        run: bash setup.sh
+
+      - name: Run add-stable-asg.sh (on-demand stable tier)
+        run: AWS_REGION=us-east-2 bash add-stable-asg.sh
+
+      - name: Summary
+        run: |
+          echo "## Runner fleet provisioned in new account (447393542383)" >> "$GITHUB_STEP_SUMMARY"
+          API_ID=$(aws apigatewayv2 get-apis --region "$AWS_REGION" \
+            --query "Items[?Name=='gh-runner-webhook'].ApiId | [0]" --output text)
+          echo "- Webhook: https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/webhook" >> "$GITHUB_STEP_SUMMARY"
+          aws autoscaling describe-auto-scaling-groups --region "$AWS_REGION" \
+            --query "AutoScalingGroups[?starts_with(AutoScalingGroupName,'gh-runner')].{ASG:AutoScalingGroupName,Min:MinSize,Max:MaxSize,Desired:DesiredCapacity}" \
+            --output table >> "$GITHUB_STEP_SUMMARY" || true
