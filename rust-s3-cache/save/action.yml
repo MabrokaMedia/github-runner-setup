@@ -16,7 +16,7 @@ inputs:
   bucket:
     description: S3 bucket name.
     required: false
-    default: mabroka-ci-cache
+    default: mabroka-ci-cache-447393542383
   region:
     description: AWS region.
     required: false
