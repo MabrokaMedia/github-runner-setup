@@ -41,9 +41,10 @@ Scale-to-zero GitHub Actions self-hosted runners on AWS EC2 Spot (ARM64).
 > A job asking for `small` is therefore not slow — it is **unschedulable**, and
 > sits `queued` until its run expires. `migrate-to-small-and-nextest.py` spread
 > the label to ~20 repos' fmt jobs, all of which silently never ran; they were
-> repointed to `ubuntu-latest` on 2026-08-08. `fleet-keeper.yml` in
-> davoxi-backend now fails red when any queued job requests a label with no ASG
-> behind it, so this cannot go unnoticed again.
+> repointed to `ubuntu-latest` on 2026-08-08, and that script has since been
+> cut down to its still-useful half and renamed `migrate-to-nextest.py`.
+> `fleet-keeper.yml` in davoxi-backend now fails red when any queued job
+> requests a label with no ASG behind it, so this cannot go unnoticed again.
 
 The `fast` ASG uses a **MixedInstancesPolicy** with `price-capacity-optimized` spot allocation so the scheduler picks the cheapest ARM64 pool available. Instances are `--ephemeral` — one job per runner, then self-terminate and decrement desired capacity.
 
