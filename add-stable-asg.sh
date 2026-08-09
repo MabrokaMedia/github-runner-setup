@@ -15,7 +15,7 @@ export MSYS2_ARG_CONV_EXCL='*'
 # Add a third runner tier: gh-runner-stable-asg (100% on-demand)
 # =============================================================================
 # Why:
-#   The fast and small ASGs are 100% spot. Long-running jobs (cargo lambda
+#   The fast ASG is 100% spot. Long-running jobs (cargo lambda
 #   build, serverless deploy) routinely run 20-30 min and get reclaimed mid-
 #   flight when the spot pool churns. The fix isn't more diversification —
 #   c7g/c6g/m6g/m7g already covers four pools — it's an on-demand fallback
@@ -189,7 +189,7 @@ else
     log "Created ASG: $STABLE_ASG (min=0, max=$MAX_RUNNERS, desired=0)"
 fi
 
-# Suspend AZ rebalancing — same rationale as the fast/small ASGs (ephemeral
+# Suspend AZ rebalancing — same rationale as the fast ASG (ephemeral
 # runners, single-AZ on purpose, no value in cross-AZ shuffling).
 aws autoscaling suspend-processes \
     --auto-scaling-group-name "$STABLE_ASG" \
@@ -203,7 +203,10 @@ echo "════════════════════════�
 echo " STEP 5: Capacity rebalance (free; tightens spot recovery)"
 echo "═══════════════════════════════════════════════════════════════"
 
-for asg in "$FAST_ASG" "${PREFIX}-small-asg"; do
+# $FAST_ASG is the only spot ASG — the stable tier is on-demand, so capacity
+# rebalance does not apply to it. This loop also covered "${PREFIX}-small-asg",
+# an ASG that was never created in any account; see the note in scaler.py.
+for asg in "$FAST_ASG"; do
     if aws autoscaling describe-auto-scaling-groups \
         --auto-scaling-group-names "$asg" \
         --region "$AWS_REGION" \

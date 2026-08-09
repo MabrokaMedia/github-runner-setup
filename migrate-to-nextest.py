@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Migrate existing self-hosted runner workflows to:
-  1. Route fmt jobs to the `small` runner tier (c7g.large), saving ~75% on
-     those runner-hours.
-  2. Replace `cargo test ...` with `cargo nextest run ...` (2-3× faster).
+Migrate existing self-hosted runner workflows to replace `cargo test ...` with
+`cargo nextest run ...` (2-3× faster).
 
 Detection:
-  - fmt job: any job whose `steps:` include a `cargo fmt` invocation.
   - test step: any step whose `run:` (single- or multi-line) starts with
     `cargo test`. Doctest cases (`--doc`) and targeted-binary cases
     (`cargo test <name>`) are skipped.
 
-Usage: python migrate-to-small-and-nextest.py <path>
+This script used to do a second thing: rewrite fmt jobs' `runs-on` from the
+`fast` label to `small`. There is no `small` tier — `gh-runner-small-asg` was
+never created in any account — so the ~20 repos it migrated had their Rustfmt
+jobs sit `queued` for a month until the runs expired. Those repos were
+repointed to `ubuntu-latest` on 2026-08-08 and the dead route was removed from
+`lambda/scaler.py`. Send trivial jobs to GitHub-hosted runners; do not add a
+`runs-on` rewrite back here unless the tier it names actually exists.
+
+Usage: python migrate-to-nextest.py <path>
 """
 import re
 import sys
@@ -45,30 +50,9 @@ def find_step_start(lines: list, run_line_idx: int) -> int | None:
 
 def rewrite(src: str) -> tuple[str, dict]:
     lines = src.splitlines(keepends=False)
-    stats = {"fmt_small": 0, "test_nextest": 0}
+    stats = {"test_nextest": 0}
 
-    # Pass 1: identify jobs containing `cargo fmt`
-    fmt_jobs = set()  # job-start line indices
-    current_job_start = None
-    current_job_has_fmt = False
-
-    def flush():
-        nonlocal current_job_start, current_job_has_fmt
-        if current_job_start is not None and current_job_has_fmt:
-            fmt_jobs.add(current_job_start)
-        current_job_start = None
-        current_job_has_fmt = False
-
-    for i, ln in enumerate(lines):
-        m = re.match(r"^(  )([a-zA-Z_][\w-]*):\s*$", ln)
-        if m:
-            flush()
-            current_job_start = i
-        elif current_job_start is not None and "cargo fmt" in ln:
-            current_job_has_fmt = True
-    flush()
-
-    # Pass 2: find which step indices (0-based from start of step's `- `) we
+    # Pass 1: find which step indices (0-based from start of step's `- `) we
     # want to insert the nextest install step before. Also mark test-command
     # lines that need `cargo test` → `cargo nextest run`.
     install_before_step = []  # list of (step_start_idx, step_indent)
@@ -121,21 +105,13 @@ def rewrite(src: str) -> tuple[str, dict]:
     # Deduplicate / sort insert points descending so we don't shift indices
     install_before_step = sorted(set(install_before_step), key=lambda x: -x[0])
 
-    # Pass 3: build output
+    # Pass 2: build output
     # Convert `install_before_step` to a dict: line_idx -> step_indent
     install_map = {idx: ind for idx, ind in install_before_step}
 
     out = []
-    current_job_start = None
-    in_fmt_job = False
 
     for i, ln in enumerate(lines):
-        # Enter new job?
-        m = re.match(r"^(  )([a-zA-Z_][\w-]*):\s*$", ln)
-        if m:
-            current_job_start = i
-            in_fmt_job = i in fmt_jobs
-
         # Insert nextest install step before this line?
         if i in install_map:
             indent = " " * install_map[i]
@@ -143,15 +119,7 @@ def rewrite(src: str) -> tuple[str, dict]:
             out.append(f"{indent}  run: curl -LsSf https://get.nexte.st/latest/linux-arm | tar -xzvf - -C ${{CARGO_HOME:-/opt/rust}}/bin")
             stats["test_nextest"] += 1
 
-        # 1) Swap fmt job's runs-on: fast -> small
-        if in_fmt_job:
-            m_ro = re.match(r"^(\s*runs-on:\s*\[self-hosted,\s*linux,\s*arm64,\s*)fast(\s*\]\s*)$", ln)
-            if m_ro:
-                out.append(f"{m_ro.group(1)}small{m_ro.group(2)}")
-                stats["fmt_small"] += 1
-                continue
-
-        # 2) Rewrite the cargo test invocation itself
+        # Rewrite the cargo test invocation itself
         if i in replace_test_cmd:
             out.append(re.sub(r"\bcargo test\b", "cargo nextest run", ln, count=1))
             continue
@@ -163,7 +131,7 @@ def rewrite(src: str) -> tuple[str, dict]:
 
 def main():
     if len(sys.argv) != 2:
-        print("usage: migrate-to-small-and-nextest.py <path>", file=sys.stderr)
+        print("usage: migrate-to-nextest.py <path>", file=sys.stderr)
         sys.exit(2)
     p = Path(sys.argv[1])
     src = p.read_text(encoding="utf-8")
