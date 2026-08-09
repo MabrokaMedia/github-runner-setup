@@ -4,8 +4,11 @@ Receives workflow_job webhooks from GitHub, scales the appropriate ASG up for qu
 
 Routes by label:
   - label "stable" -> gh-runner-stable-asg (c7g.2xlarge on-demand — long deploys/builds)
-  - label "small"  -> gh-runner-small-asg  (c7g.large spot)
   - else           -> gh-runner-asg        (c7g.2xlarge spot, default)
+
+There is no "small" tier. The label used to route here to `gh-runner-small-asg`,
+which was never created in any account, so every job carrying it failed to scale
+and sat queued until it expired. Only add a route once the ASG actually exists.
 """
 
 import json
@@ -18,12 +21,15 @@ autoscaling = boto3.client("autoscaling")
 ssm = boto3.client("ssm")
 
 FAST_ASG = os.environ.get("FAST_ASG_NAME", os.environ.get("ASG_NAME", "gh-runner-asg"))
-SMALL_ASG = os.environ.get("SMALL_ASG_NAME", "gh-runner-small-asg")
 STABLE_ASG = os.environ.get("STABLE_ASG_NAME", "gh-runner-stable-asg")
 MAX_RUNNERS = int(os.environ.get("MAX_RUNNERS", "10"))
 WEBHOOK_SECRET_PARAM = os.environ["WEBHOOK_SECRET_PARAM"]
 # Common discriminator labels our workflows set — if present, job is for our runners
 BASE_LABELS = {"self-hosted", "arm64"}
+
+
+class UnknownAsgError(RuntimeError):
+    """A configured ASG name does not exist in this account/region."""
 
 
 def verify_signature(body: str, signature: str, secret: str) -> bool:
@@ -38,12 +44,10 @@ def pick_asg(job_labels: set) -> str | None:
     # Must at least claim the base labels
     if not BASE_LABELS.issubset(job_labels):
         return None
-    # `stable` wins over `fast`/`small` if both are set, so a workflow can
-    # opt a single job up to on-demand without rewriting the rest.
+    # `stable` wins over `fast` if both are set, so a workflow can opt a single
+    # job up to on-demand without rewriting the rest.
     if "stable" in job_labels:
         return STABLE_ASG
-    if "small" in job_labels:
-        return SMALL_ASG
     if "fast" in job_labels:
         return FAST_ASG
     # Default anything else matching base labels to fast
@@ -54,7 +58,17 @@ def get_asg_state(asg_name: str):
     resp = autoscaling.describe_auto_scaling_groups(
         AutoScalingGroupNames=[asg_name]
     )
-    asg = resp["AutoScalingGroups"][0]
+    groups = resp["AutoScalingGroups"]
+    # A name that doesn't exist is not an API error — it comes back as an empty
+    # list. Indexing it blind gave operators a bare `IndexError: list index out
+    # of range` with no hint that the ASG name was the problem.
+    if not groups:
+        raise UnknownAsgError(
+            f"ASG {asg_name!r} does not exist in {os.environ.get('AWS_REGION', '?')}. "
+            "Check FAST_ASG_NAME/STABLE_ASG_NAME on this Lambda and the routing "
+            "table in pick_asg()."
+        )
+    asg = groups[0]
     return {
         "desired": asg["DesiredCapacity"],
         "running": len([
@@ -94,7 +108,13 @@ def _schedule_retry():
 
 def handler(event, context):
     if event.get("_periodic_check") or event.get("_retry"):
-        for asg in (FAST_ASG, SMALL_ASG, STABLE_ASG):
+        failed = []
+        for asg in (FAST_ASG, STABLE_ASG):
+            # Per-ASG catch so one broken tier doesn't stop the others from
+            # scaling. Deliberately no re-raise: this path runs as an async
+            # (Event) invoke, so raising would make Lambda replay the whole
+            # loop twice and double-bump the healthy ASGs. Failures are tagged
+            # ERROR instead — alarm on a metric filter, not on Errors.
             try:
                 state = get_asg_state(asg)
                 if state["desired"] < MAX_RUNNERS:
@@ -104,7 +124,13 @@ def handler(event, context):
                     )
                     print(f"Periodic: {asg} {state['desired']} -> {new}")
             except Exception as e:
-                print(f"Periodic: {asg}: {e}")
+                failed.append(asg)
+                print(f"ERROR Periodic: {asg}: {type(e).__name__}: {e}")
+        if failed:
+            return {
+                "statusCode": 500,
+                "body": f"Periodic check failed for: {', '.join(failed)}",
+            }
         return {"statusCode": 200, "body": "Periodic check done"}
 
     body = event.get("body", "")
@@ -133,6 +159,9 @@ def handler(event, context):
     if not target:
         return {"statusCode": 200, "body": "Labels don't match, skipping"}
 
+    # UnknownAsgError propagates on purpose: this path is synchronous, so a
+    # misrouted label surfaces as a failed webhook delivery in GitHub *and* on
+    # the Lambda Errors metric, rather than a 200 that pretends it scaled.
     scaled = scale_up(target)
     return {
         "statusCode": 200,
