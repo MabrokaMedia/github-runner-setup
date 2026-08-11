@@ -81,6 +81,10 @@ steps:
       cache-hit: ${{ steps.rust-cache.outputs.cache-hit }}
 ```
 
+Set `refresh-on-hit: "true"` on long build jobs if the restored `target/`
+cache should be warmed back into S3 after the build. Existing callers that pass
+`cache-hit: 'false'` continue to force that refresh for compatibility.
+
 The EC2 instance role already has scoped access to `s3://mabroka-ci-cache`, so no AWS credentials step is needed.
 
 ## Why same-region S3 cache instead of `actions/cache`
