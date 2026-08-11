@@ -10,9 +10,13 @@ inputs:
     description: Cache key from the restore step's `key` output. Required — pairs with the restore.
     required: true
   cache-hit:
-    description: cache-hit output from the restore step. If "true", save is skipped.
+    description: cache-hit output from the restore step. If "true", save is skipped unless refresh-on-hit is enabled. If explicitly "false", a successful restore hit is refreshed for backward compatibility.
     required: false
     default: ""
+  refresh-on-hit:
+    description: Save a fresh archive even after a successful restore hit. Use for long Rust builds where target fingerprints drift on persistent self-hosted runners.
+    required: false
+    default: "false"
   bucket:
     description: S3 bucket name.
     required: false
@@ -31,6 +35,8 @@ runs:
         AWS_DEFAULT_REGION: ${{ inputs.region }}
         BUCKET: ${{ inputs.bucket }}
         KEY: ${{ inputs.key }}
+        CACHE_HIT_INPUT: ${{ inputs.cache-hit }}
+        REFRESH_ON_HIT_INPUT: ${{ inputs.refresh-on-hit }}
       run: |
         set -euo pipefail
         echo "cache key: ${KEY}"
@@ -43,13 +49,28 @@ runs:
         # `unable to read .cargo-ok ... stream did not contain valid UTF-8`.
         STATE_FILE="${RUNNER_TEMP:-/tmp}/rust-s3-cache-state"
         STATE="$(cat "${STATE_FILE}" 2>/dev/null || echo MISSING)"
+        CACHE_HIT_INPUT="${CACHE_HIT_INPUT,,}"
+        REFRESH_ON_HIT_INPUT="${REFRESH_ON_HIT_INPUT,,}"
+        REFRESH_REQUESTED=false
+        if [[ "${REFRESH_ON_HIT_INPUT}" == "true" || "${REFRESH_ON_HIT_INPUT}" == "1" || "${REFRESH_ON_HIT_INPUT}" == "yes" ]]; then
+          REFRESH_REQUESTED=true
+        fi
+        # Back-compat: older backend workflows pass cache-hit: 'false' to force
+        # a post-build save. Keep honoring that when restore completed as a hit.
+        if [[ "${CACHE_HIT_INPUT}" == "false" ]]; then
+          REFRESH_REQUESTED=true
+        fi
         case "${STATE}" in
           MISS)
             echo "restore confirmed cache miss; proceeding with save"
             ;;
           HIT-COMPLETE)
-            echo "restore was a cache hit; cache already populated, skipping save"
-            exit 0
+            if [[ "${REFRESH_REQUESTED}" == "true" ]]; then
+              echo "restore was a cache hit; refresh requested, proceeding with save"
+            else
+              echo "restore was a cache hit; cache already populated, skipping save"
+              exit 0
+            fi
             ;;
           *)
             echo "restore-state='${STATE}' (expected MISS or HIT-COMPLETE) — restore was interrupted, never ran, or the sentinel was clobbered. Skipping save to avoid uploading an inconsistent registry."
@@ -57,7 +78,7 @@ runs:
             ;;
         esac
         # Back-compat short-circuit: callers may still pass cache-hit explicitly.
-        if [[ "${{ inputs.cache-hit }}" == "true" ]]; then
+        if [[ "${CACHE_HIT_INPUT}" == "true" && "${REFRESH_REQUESTED}" != "true" ]]; then
           echo "cache already populated (cache-hit=true), skipping save"
           exit 0
         fi
