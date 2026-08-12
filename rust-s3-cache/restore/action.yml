@@ -76,13 +76,38 @@ runs:
         if aws s3api head-object --bucket "${BUCKET}" --key "${KEY}.tar.zst" >/dev/null 2>&1; then
           SIZE=$(aws s3api head-object --bucket "${BUCKET}" --key "${KEY}.tar.zst" --query ContentLength --output text)
           echo "cache HIT: s3://${BUCKET}/${KEY}.tar.zst (${SIZE} bytes)"
-          aws s3 cp "s3://${BUCKET}/${KEY}.tar.zst" - --no-progress \
-            | zstd -d --long=27 \
-            | tar -xf - -C /
-          # Sentinel + cache-hit output written ONLY after tar fully succeeds. If the step is
-          # cancelled mid-extract, neither line runs, and save will see no sentinel.
-          echo HIT-COMPLETE > "${STATE_FILE}"
-          echo "cache-hit=true" >> "$GITHUB_OUTPUT"
+          # A cache read is an OPTIMISATION, never a correctness input, so a failed read
+          # degrades to a cold build instead of failing the job. Until this was guarded, any
+          # read failure killed the job outright, having built nothing.
+          #
+          # The read is genuinely racy and always will be. `save` promotes via a server-side
+          # copy onto the canonical key, which is atomic for a reader that has not started
+          # yet, but NOT for one already mid-download: the CLI fetches a multi-GB object with
+          # ranged GETs, so a promote landing between two ranges serves the tail from the new
+          # object and the transfer aborts on an ETag mismatch. Seen on davoxi-backend#647
+          # (2026-08-12): a 2159982094-byte HIT was overwritten with 2137703512 bytes
+          # mid-download and Clippy died here having linted nothing. Keys are shared across
+          # concurrent runs, so this is reachable whenever two runs overlap: not a rare
+          # corruption event.
+          if aws s3 cp "s3://${BUCKET}/${KEY}.tar.zst" - --no-progress | zstd -d --long=27 | tar -xf - -C /; then
+            # Sentinel + cache-hit output written ONLY after tar fully succeeds. If the step is
+            # cancelled mid-extract, neither line runs, and save will see no sentinel.
+            echo HIT-COMPLETE > "${STATE_FILE}"
+            echo "cache-hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning title=Rust S3 cache restore failed::Could not restore s3://${BUCKET}/${KEY}.tar.zst (concurrent overwrite, truncated object, or transfer error). Continuing as a cold build."
+            # The extract died partway, so target/ and the registry may hold a fragment of the
+            # archive. Cargo would build against a half-populated registry and fail in
+            # confusing ways, so discard all three roots and start genuinely cold. Scoped to
+            # THIS branch on purpose: a plain MISS must not delete anything, since persistent
+            # self-hosted runners may carry a warm registry we did not put there.
+            rm -rf "${WORKSPACE_ABS}/target" "${CARGO_ROOT}/registry" "${CARGO_ROOT}/git"
+            mkdir -p "${WORKSPACE_ABS}/target" "${CARGO_ROOT}/registry" "${CARGO_ROOT}/git"
+            # MISS (not MISSING) so `save` re-uploads a clean archive at the end of this job:
+            # the bad key heals on the next run instead of needing a manual purge.
+            echo MISS > "${STATE_FILE}"
+            echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+          fi
         else
           echo "cache MISS: s3://${BUCKET}/${KEY}.tar.zst"
           echo MISS > "${STATE_FILE}"

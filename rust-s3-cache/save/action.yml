@@ -134,7 +134,13 @@ runs:
           exit 1
         fi
 
-        # Promote: server-side copy staging → canonical (atomic from any reader's POV).
+        # Promote: server-side copy staging -> canonical. This is atomic for a reader that
+        # has not started yet, but NOT for one already mid-download: the CLI pulls large
+        # objects with ranged GETs, and a promote landing between two of them serves the
+        # tail from the new object, aborting that reader on an ETag mismatch. The restore
+        # action therefore treats a failed read as a cache miss rather than a job failure
+        # (davoxi-backend#647, 2026-08-12). Do not 'fix' that fallback by assuming this
+        # copy protects in-flight readers -- it does not.
         # `--copy-props none` skips tag/metadata preservation — without it, `aws s3 cp` calls
         # GetObjectTagging on the source, which the gh-runner-ec2-role IAM does NOT permit
         # (we don't tag cache objects, so this is purely overhead). Found via 2026-05-07
