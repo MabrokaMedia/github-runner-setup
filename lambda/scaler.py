@@ -15,6 +15,8 @@ import json
 import hashlib
 import hmac
 import os
+import urllib.error
+import urllib.request
 import boto3
 
 autoscaling = boto3.client("autoscaling")
@@ -24,6 +26,10 @@ FAST_ASG = os.environ.get("FAST_ASG_NAME", os.environ.get("ASG_NAME", "gh-runner
 STABLE_ASG = os.environ.get("STABLE_ASG_NAME", "gh-runner-stable-asg")
 MAX_RUNNERS = int(os.environ.get("MAX_RUNNERS", "10"))
 WEBHOOK_SECRET_PARAM = os.environ["WEBHOOK_SECRET_PARAM"]
+# Same PAT the runners boot with. Lets a queued-job webhook ask GitHub how
+# many self-hosted jobs are ACTUALLY queued right now, so concurrent
+# invocations all compute the same target instead of racing +1 writes.
+GITHUB_PAT_PARAM = os.environ.get("GITHUB_PAT_PARAM", "/gh-runner/github-pat")
 # Common discriminator labels our workflows set — if present, job is for our runners
 BASE_LABELS = {"self-hosted", "arm64"}
 
@@ -78,18 +84,109 @@ def get_asg_state(asg_name: str):
     }
 
 
-def scale_up(asg_name: str):
+_pat_cache = {"v": None}
+
+
+def _github_pat() -> str | None:
+    if _pat_cache["v"] is None:
+        try:
+            _pat_cache["v"] = ssm.get_parameter(Name=GITHUB_PAT_PARAM, WithDecryption=True)["Parameter"]["Value"] or ""
+        except Exception as e:  # noqa: BLE001 — degrade to the fallback path, never fail the webhook
+            print(f"github pat unavailable ({e}); falling back to verify-loop scaling")
+            _pat_cache["v"] = ""
+    return _pat_cache["v"] or None
+
+
+def count_queued_self_hosted(repo_full_name: str, wanted_labels: set) -> int | None:
+    """How many jobs are queued RIGHT NOW in this repo whose labels match
+    this ASG's tier. None when GitHub cannot be asked (no PAT, API error) —
+    the caller then uses the fallback.
+
+    Two API pages of queued runs is plenty: the fleet's MAX_RUNNERS is 10
+    and a repo rarely has more than a handful of queued runs at once.
+    """
+    pat = _github_pat()
+    if not pat:
+        return None
+    hdr = {"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github+json",
+           "User-Agent": "gh-runner-scaler"}
+    try:
+        n = 0
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{repo_full_name}/actions/runs?status=queued&per_page=30", headers=hdr)
+        with urllib.request.urlopen(req, timeout=8) as r:
+            runs = json.load(r).get("workflow_runs", [])
+        for run in runs[:20]:
+            jreq = urllib.request.Request(
+                f"https://api.github.com/repos/{repo_full_name}/actions/runs/{run['id']}/jobs?per_page=50", headers=hdr)
+            with urllib.request.urlopen(jreq, timeout=8) as r:
+                for j in json.load(r).get("jobs", []):
+                    if j.get("status") == "queued" and wanted_labels.issubset(set(j.get("labels", []))):
+                        n += 1
+        return n
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError) as e:
+        print(f"count_queued_self_hosted failed ({e}); falling back to verify-loop scaling")
+        return None
+
+
+def scale_up(asg_name: str, repo_full_name: str | None = None, job_labels: set | None = None):
+    """Make sure every queued job for this ASG's tier has a runner coming.
+
+    Two `workflow_job queued` webhooks for the same workflow arrive within
+    the same second (Rustfmt+Test, Clippy+Test — the COMMON case) and run
+    as two concurrent invocations. The old code was read-desired /
+    write-desired+1 with no lock: both read 0, both wrote 1. Observed live
+    2026-08-18 07:34:45 — two events, two "scaled 0 -> 1" lines, ONE
+    runner. It took the first job and, being ephemeral, exited; the second
+    job sat queued for hours with desired back at 0. Reserved concurrency
+    of 1 would serialise this but the account's Lambda ceiling is 10 and
+    reserving one drops unreserved below the minimum.
+
+    Preferred path (idempotent): ask GitHub how many jobs are queued for
+    this tier right now and set desired = max(current, that count). N
+    concurrent invocations all compute the same number and write the same
+    number; there is nothing to race. Fallback when GitHub is unreachable:
+    +1 with a bounded write-then-verify, which narrows the window to
+    milliseconds and errs towards one idle runner rather than one
+    starved job.
+    """
     state = get_asg_state(asg_name)
-    new_desired = min(state["desired"] + 1, MAX_RUNNERS)
-    if new_desired <= state["desired"]:
+    if state["desired"] >= MAX_RUNNERS:
         print(f"{asg_name}: already at max capacity ({MAX_RUNNERS}). Scheduling retry in 90s.")
         _schedule_retry()
         return False
-    autoscaling.set_desired_capacity(
-        AutoScalingGroupName=asg_name,
-        DesiredCapacity=new_desired,
-    )
-    print(f"{asg_name}: scaled {state['desired']} -> {new_desired}")
+
+    queued = None
+    if repo_full_name and job_labels:
+        queued = count_queued_self_hosted(repo_full_name, job_labels)
+
+    if queued is not None:
+        # Every queued job needs a runner that is not already busy. Runners
+        # are ephemeral (one job each), so `running` runners are spoken for.
+        target = min(max(state["desired"], state["running"] + queued), MAX_RUNNERS)
+        if target <= state["desired"]:
+            print(f"{asg_name}: desired={state['desired']} already covers running={state['running']}+queued={queued}")
+            return True
+        autoscaling.set_desired_capacity(AutoScalingGroupName=asg_name, DesiredCapacity=target)
+        print(f"{asg_name}: scaled {state['desired']} -> {target} (running={state['running']}, queued={queued})")
+        return True
+
+    # Fallback: +1 with verify.
+    intended = min(state["desired"] + 1, MAX_RUNNERS)
+    autoscaling.set_desired_capacity(AutoScalingGroupName=asg_name, DesiredCapacity=intended)
+    print(f"{asg_name}: scaled {state['desired']} -> {intended} (fallback +1)")
+    for attempt in range(3):
+        after = get_asg_state(asg_name)["desired"]
+        if after >= intended:
+            return True
+        bumped = min(after + 1, MAX_RUNNERS)
+        if bumped <= after:
+            _schedule_retry()
+            return False
+        autoscaling.set_desired_capacity(AutoScalingGroupName=asg_name, DesiredCapacity=bumped)
+        print(f"{asg_name}: verify attempt {attempt+1}: desired was {after} < {intended} — re-bumped to {bumped}")
+        intended = bumped
+    _schedule_retry()
     return True
 
 
@@ -162,7 +259,8 @@ def handler(event, context):
     # UnknownAsgError propagates on purpose: this path is synchronous, so a
     # misrouted label surfaces as a failed webhook delivery in GitHub *and* on
     # the Lambda Errors metric, rather than a 200 that pretends it scaled.
-    scaled = scale_up(target)
+    repo_full_name = (payload.get("repository") or {}).get("full_name")
+    scaled = scale_up(target, repo_full_name, job_labels)
     return {
         "statusCode": 200,
         "body": f"Scaled up {target}" if scaled else f"{target}: at max capacity",
