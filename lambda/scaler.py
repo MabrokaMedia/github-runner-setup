@@ -112,11 +112,17 @@ def count_queued_self_hosted(repo_full_name: str, wanted_labels: set) -> int | N
            "User-Agent": "gh-runner-scaler"}
     try:
         n = 0
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{repo_full_name}/actions/runs?status=queued&per_page=30", headers=hdr)
-        with urllib.request.urlopen(req, timeout=8) as r:
-            runs = json.load(r).get("workflow_runs", [])
-        for run in runs[:20]:
+        # A run is `queued` only until its FIRST job starts; a run whose
+        # Test/Fargate jobs already ran is `in_progress` while its Build
+        # job sits queued (live 2026-08-18 17:51: Build Lambda queued 20
+        # min, this function counted 0, nothing scaled). Look at both.
+        runs = []
+        for status in ("queued", "in_progress"):
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{repo_full_name}/actions/runs?status={status}&per_page=30", headers=hdr)
+            with urllib.request.urlopen(req, timeout=8) as r:
+                runs.extend(json.load(r).get("workflow_runs", []))
+        for run in runs[:30]:
             jreq = urllib.request.Request(
                 f"https://api.github.com/repos/{repo_full_name}/actions/runs/{run['id']}/jobs?per_page=50", headers=hdr)
             with urllib.request.urlopen(jreq, timeout=8) as r:
@@ -161,6 +167,10 @@ def scale_up(asg_name: str, repo_full_name: str | None = None, job_labels: set |
         queued = count_queued_self_hosted(repo_full_name, job_labels)
 
     if queued is not None:
+        # The webhook that invoked us IS one queued job for this tier;
+        # the listing can lag it by a few seconds. Never trust a count
+        # below one.
+        queued = max(queued, 1)
         # Every queued job needs a runner that is not already busy. Runners
         # are ephemeral (one job each), so `running` runners are spoken for.
         target = min(max(state["desired"], state["running"] + queued), MAX_RUNNERS)
