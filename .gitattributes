@@ -1,0 +1,6 @@
+# Shell scripts and unit files run on Linux. A CRLF checkout breaks them with
+# "bad interpreter: /usr/bin/env bash^M", so pin them regardless of the OS the
+# clone happens on.
+*.sh text eol=lf
+*.service text eol=lf
+*.py text eol=lf
