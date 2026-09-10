@@ -37,7 +37,10 @@ id runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner
 getent group docker >/dev/null 2>&1 && usermod -aG docker runner || true
 
 echo "==> config"
-install -d -m 0750 /etc/gh-runner
+# root:runner, not root:root. The units run as `runner`, so root-only files
+# leave the loop unable to read its own configuration or the token, and it
+# exits before registering.
+install -d -m 0750 -o root -g runner /etc/gh-runner
 if [ ! -s /etc/gh-runner/pat ]; then
   cat >&2 <<'MSG'
 
@@ -46,19 +49,23 @@ if [ ! -s /etc/gh-runner/pat ]; then
   Put a GitHub PAT with org runner admin rights there, then re-run:
 
       printf '%s' 'ghp_xxx' > /etc/gh-runner/pat
-      chmod 600 /etc/gh-runner/pat
+
+  provision.sh fixes its ownership and mode; it does not need to be readable
+  by anyone but root before you run it.
 
   This is the same token the EC2 fleet reads from SSM /gh-runner/github-pat.
 MSG
   exit 1
 fi
-chmod 600 /etc/gh-runner/pat
+chown root:runner /etc/gh-runner/pat
+chmod 640 /etc/gh-runner/pat
 cat > /etc/gh-runner/runner.env <<ENV
 ORG_NAME=${ORG_NAME}
 RUNNER_LABELS=${RUNNER_LABELS}
 BASE_DIR=${BASE_DIR}
 PAT_FILE=/etc/gh-runner/pat
 ENV
+chown root:runner /etc/gh-runner/runner.env
 chmod 640 /etc/gh-runner/runner.env
 
 echo "==> runner binaries"

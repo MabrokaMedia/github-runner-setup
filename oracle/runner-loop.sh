@@ -9,8 +9,15 @@ set -euo pipefail
 
 SLOT="${1:?usage: runner-loop.sh <slot-number>}"
 CONF=/etc/gh-runner/runner.env
+# Fail loudly rather than silently skipping: an unreadable config used to
+# surface as "ORG_NAME missing", which points at the file's contents when the
+# real fault is its permissions.
+if [ ! -r "$CONF" ]; then
+  echo "cannot read $CONF as $(id -un) — check it is root:runner mode 640" >&2
+  exit 1
+fi
 # shellcheck source=/dev/null
-[ -r "$CONF" ] && . "$CONF"
+. "$CONF"
 
 ORG_NAME="${ORG_NAME:?ORG_NAME missing from $CONF}"
 RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,arm64,fast,stable}"
