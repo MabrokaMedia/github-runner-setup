@@ -9,7 +9,7 @@
 #   sudo ./provision.sh
 set -euo pipefail
 
-SLOTS="${SLOTS:-3}"                 # leave a core for the OS on a 4-core box
+SLOTS="${SLOTS:-4}"                 # one slot per core; CI is mostly IO-bound
 BASE_DIR="${BASE_DIR:-/opt/gh-runner}"
 ORG_NAME="${ORG_NAME:-MabrokaMedia}"
 RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,arm64,fast,stable}"
@@ -17,20 +17,38 @@ RUNNER_LABELS="${RUNNER_LABELS:-self-hosted,linux,arm64,fast,stable}"
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 
 echo "==> dependencies"
-# Oracle Linux ships dnf, Ubuntu images ship apt; support both.
+# The EC2 fleet ran a baked AMI on Amazon Linux, which supplied a C toolchain
+# and the AWS CLI in its base image. A stock Ubuntu image does not, and their
+# absence does not read as a missing package: Rust jobs fail with
+# "linker `cc` not found", and the S3 cache action dies on "aws: command not
+# found" mid-pipe instead of degrading to a cache miss. Both cost a red build.
 if command -v dnf >/dev/null 2>&1; then
-  dnf install -y git jq libicu tar gzip zstd curl
+  dnf install -y git jq libicu tar gzip zstd curl unzip                  gcc gcc-c++ make lld pkgconfig openssl-devel
   # Docker is optional: only workflows using container jobs or services need it.
   dnf install -y docker || dnf install -y podman-docker || true
   systemctl enable --now docker 2>/dev/null || true
 else
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y git jq libicu[0-9]* tar gzip zstd curl ca-certificates || \
-    apt-get install -y git jq tar gzip zstd curl ca-certificates
+  # build-essential provides `cc`; lld matches the AMI, which added it because
+  # linking dominates large release builds.
+  apt-get install -y git jq tar gzip zstd curl unzip ca-certificates                      build-essential lld pkg-config libssl-dev
+  apt-get install -y libicu-dev || true
   apt-get install -y docker.io || true
   systemctl enable --now docker 2>/dev/null || true
 fi
+
+# AWS CLI v2. Still required after the move, because the rust-s3-cache
+# composite actions shell out to it.
+if ! command -v aws >/dev/null 2>&1; then
+  echo "==> aws cli"
+  tmp=$(mktemp -d)
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "$tmp/awscli.zip"
+  unzip -q "$tmp/awscli.zip" -d "$tmp"
+  "$tmp/aws/install" --update >/dev/null
+  rm -rf "$tmp"
+fi
+echo "    cc=$(command -v cc || echo MISSING)  aws=$(command -v aws || echo MISSING)"
 
 echo "==> runner user"
 id runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner
