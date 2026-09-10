@@ -1,0 +1,22 @@
+[Unit]
+Description=Ephemeral GitHub Actions runner, slot %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=runner
+Group=runner
+ExecStart=/opt/gh-runner/runner-loop.sh %i
+# --ephemeral means a clean exit after one job; coming straight back is the
+# point, not a failure. The delay keeps a misconfiguration from hammering the
+# GitHub API in a tight loop.
+Restart=always
+RestartSec=5
+KillMode=process
+KillSignal=SIGTERM
+# Long builds must not be killed mid-flight during a restart or a shutdown.
+TimeoutStopSec=3600
+
+[Install]
+WantedBy=multi-user.target
