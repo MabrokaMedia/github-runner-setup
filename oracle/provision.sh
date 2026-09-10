@@ -86,6 +86,14 @@ ENV
 chown root:runner /etc/gh-runner/runner.env
 chmod 640 /etc/gh-runner/runner.env
 
+# Shared build cache. rust-s3-cache's `disk` backend writes here instead of to
+# the S3 bucket in us-east-2, which is faster (the archive never leaves the
+# machine) and survives the AWS account going away. Shared across slots on
+# purpose: a cache warmed by one job should serve the next, whichever slot
+# takes it.
+echo "==> build cache"
+install -d -m 0775 -o runner -g runner "${CACHE_DIR:-/opt/gh-runner/cache}"
+
 echo "==> runner binaries"
 install -d -o runner -g runner "$BASE_DIR"
 install -m 0755 -o runner -g runner "$(dirname "$0")/runner-loop.sh" "$BASE_DIR/runner-loop.sh"

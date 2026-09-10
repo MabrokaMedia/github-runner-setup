@@ -25,6 +25,17 @@ inputs:
     description: AWS region.
     required: false
     default: us-east-1
+  backend:
+    description: |
+      Where the archive lives. `disk` is a directory on the runner itself,
+      `s3` is the bucket, `auto` picks disk on a self-hosted runner and s3 on
+      a GitHub-hosted one. Must match the restore step.
+    required: false
+    default: auto
+  cache-dir:
+    description: Directory used by the `disk` backend. Shared across runner slots.
+    required: false
+    default: /opt/gh-runner/cache
 
 runs:
   using: composite
@@ -34,6 +45,8 @@ runs:
       env:
         AWS_DEFAULT_REGION: ${{ inputs.region }}
         BUCKET: ${{ inputs.bucket }}
+        BACKEND: ${{ inputs.backend }}
+        CACHE_DIR: ${{ inputs.cache-dir }}
         KEY: ${{ inputs.key }}
         CACHE_HIT_INPUT: ${{ inputs.cache-hit }}
         REFRESH_ON_HIT_INPUT: ${{ inputs.refresh-on-hit }}
@@ -95,6 +108,55 @@ runs:
         fi
         echo "saving: ${PATHS[*]}"
         du -sh "${PATHS[@]}" 2>/dev/null || true
+
+        if [ "${BACKEND}" = "auto" ]; then
+          if [ "${RUNNER_ENVIRONMENT:-}" = "self-hosted" ]; then BACKEND=disk; else BACKEND=s3; fi
+        fi
+        echo "cache backend: ${BACKEND}"
+
+        if [ "${BACKEND}" = "disk" ]; then
+          # Same contract as the S3 path: write somewhere private, verify tar
+          # was not reading a registry someone else was writing, and only then
+          # publish. mv(2) within one filesystem is atomic, so a reader either
+          # sees the whole old archive or the whole new one, never a mixture —
+          # which is stronger than the server-side copy S3 gives us.
+          mkdir -p "${CACHE_DIR}"
+          FILE="${CACHE_DIR}/${KEY//\//__}.tar.zst"
+          STAGING="${FILE}.staging-${GITHUB_RUN_ID:-noid}-${GITHUB_RUN_ATTEMPT:-1}-${GITHUB_JOB:-job}"
+          TAR_STDERR="$(mktemp)"
+          trap 'rm -f "${TAR_STDERR}" "${STAGING}"' EXIT
+
+          tar -cf - "${PATHS[@]}" 2>"${TAR_STDERR}" | zstd -3 --long=27 -T0 -o "${STAGING}" -q -f
+
+          if [[ -s "${TAR_STDERR}" ]]; then
+            echo "----- tar stderr -----"; cat "${TAR_STDERR}"; echo "----- end tar stderr -----"
+          fi
+          if grep -E -q "file changed as we read it|file shrank by|File removed before we read it" "${TAR_STDERR}"; then
+            echo "ERROR: tar detected concurrent registry modification. Archive is not internally"
+            echo "       consistent and was NOT promoted. The existing cache remains untouched."
+            exit 1
+          fi
+
+          mv -f "${STAGING}" "${FILE}"
+          echo "cache saved: ${FILE} ($(stat -c%s "${FILE}") bytes)"
+
+          # The disk is finite in a way the bucket was not: 100 GB shared by
+          # every repo on this host. Drop the least recently used archives once
+          # the directory passes its budget, so a busy week cannot fill the
+          # root filesystem and take the runners down with it.
+          BUDGET_MB="${CACHE_BUDGET_MB:-40000}"
+          USED_MB=$(du -sm "${CACHE_DIR}" 2>/dev/null | cut -f1)
+          if [ "${USED_MB:-0}" -gt "${BUDGET_MB}" ]; then
+            echo "cache dir ${USED_MB} MB exceeds budget ${BUDGET_MB} MB — pruning oldest"
+            ls -1t "${CACHE_DIR}"/*.tar.zst 2>/dev/null | tail -n +4 | while read -r old; do
+              [ "${old}" = "${FILE}" ] && continue
+              rm -f "${old}" && echo "  pruned $(basename "${old}")"
+              USED_MB=$(du -sm "${CACHE_DIR}" 2>/dev/null | cut -f1)
+              [ "${USED_MB:-0}" -le "${BUDGET_MB}" ] && break
+            done
+          fi
+          exit 0
+        fi
 
         # ----- Atomic upload via staging key -----
         # We never overwrite the canonical key directly. Stream tar|zstd to a per-run staging

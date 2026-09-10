@@ -22,6 +22,18 @@ inputs:
     description: Override key (skips Cargo.lock hash) — use for a single cache across branches.
     required: false
     default: ""
+  backend:
+    description: |
+      Where the archive lives. `disk` is a directory on the runner itself,
+      `s3` is the bucket, `auto` picks disk on a self-hosted runner and s3 on
+      a GitHub-hosted one. Disk is faster than S3 ever was here — the archive
+      never leaves the machine — and it does not depend on the AWS account.
+    required: false
+    default: auto
+  cache-dir:
+    description: Directory used by the `disk` backend. Shared across runner slots.
+    required: false
+    default: /opt/gh-runner/cache
 
 outputs:
   cache-hit:
@@ -62,6 +74,8 @@ runs:
         BUCKET: ${{ inputs.bucket }}
         KEY: ${{ steps.key.outputs.key }}
         WORKSPACE_ABS: ${{ steps.key.outputs.workspace-abs }}
+        BACKEND: ${{ inputs.backend }}
+        CACHE_DIR: ${{ inputs.cache-dir }}
       run: |
         set -euo pipefail
         # Sentinel lives in RUNNER_TEMP (per-job ephemeral, NOT inside CARGO_ROOT — putting it
@@ -73,6 +87,47 @@ runs:
         command -v zstd >/dev/null || sudo dnf install -y zstd >/dev/null 2>&1 || sudo apt-get install -y zstd >/dev/null 2>&1
         CARGO_ROOT="${CARGO_HOME:-$HOME/.cargo}"
         mkdir -p "${WORKSPACE_ABS}/target" "${CARGO_ROOT}/registry" "${CARGO_ROOT}/git"
+
+        # `auto` keeps one action working in both places while workflows migrate:
+        # the runner tells us which it is, so a self-hosted job uses its own disk
+        # and a GitHub-hosted one still reaches the bucket.
+        if [ "${BACKEND}" = "auto" ]; then
+          if [ "${RUNNER_ENVIRONMENT:-}" = "self-hosted" ]; then BACKEND=disk; else BACKEND=s3; fi
+        fi
+        echo "cache backend: ${BACKEND}"
+
+        if [ "${BACKEND}" = "disk" ]; then
+          # Keys contain slashes (owner/repo/rust/<hash>); flatten rather than
+          # nest, so the directory stays a flat set of archives that is trivial
+          # to list, measure and prune.
+          FILE="${CACHE_DIR}/${KEY//\//__}.tar.zst"
+          mkdir -p "${CACHE_DIR}"
+          if [ -f "${FILE}" ]; then
+            echo "cache HIT: ${FILE} ($(stat -c%s "${FILE}") bytes)"
+            # The multi-GB mid-download race that S3 has cannot happen here:
+            # save promotes with mv(2) on the same filesystem, so a reader that
+            # already opened the old file keeps reading that inode. The failure
+            # guard stays regardless, since a truncated archive is still
+            # possible if the disk filled during a previous save.
+            if zstd -dc --long=27 "${FILE}" | tar -xf - -C /; then
+              echo HIT-COMPLETE > "${STATE_FILE}"
+              echo "cache-hit=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning title=Rust disk cache restore failed::Could not restore ${FILE}. Continuing as a cold build."
+              rm -rf "${WORKSPACE_ABS}/target" "${CARGO_ROOT}/registry" "${CARGO_ROOT}/git"
+              mkdir -p "${WORKSPACE_ABS}/target" "${CARGO_ROOT}/registry" "${CARGO_ROOT}/git"
+              rm -f "${FILE}"
+              echo MISS > "${STATE_FILE}"
+              echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "cache MISS: ${FILE}"
+            echo MISS > "${STATE_FILE}"
+            echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+        fi
+
         if aws s3api head-object --bucket "${BUCKET}" --key "${KEY}.tar.zst" >/dev/null 2>&1; then
           SIZE=$(aws s3api head-object --bucket "${BUCKET}" --key "${KEY}.tar.zst" --query ContentLength --output text)
           echo "cache HIT: s3://${BUCKET}/${KEY}.tar.zst (${SIZE} bytes)"
