@@ -23,7 +23,7 @@ echo "==> dependencies"
 # "linker `cc` not found", and the S3 cache action dies on "aws: command not
 # found" mid-pipe instead of degrading to a cache miss. Both cost a red build.
 if command -v dnf >/dev/null 2>&1; then
-  dnf install -y git jq libicu tar gzip zstd curl unzip                  gcc gcc-c++ make lld pkgconfig openssl-devel
+  dnf install -y git jq libicu tar gzip zstd curl unzip zip                  gcc gcc-c++ make lld pkgconfig openssl-devel
   # Docker is optional: only workflows using container jobs or services need it.
   dnf install -y docker || dnf install -y podman-docker || true
   systemctl enable --now docker 2>/dev/null || true
@@ -32,7 +32,7 @@ else
   apt-get update -y
   # build-essential provides `cc`; lld matches the AMI, which added it because
   # linking dominates large release builds.
-  apt-get install -y git jq tar gzip zstd curl unzip ca-certificates                      build-essential lld pkg-config libssl-dev
+  apt-get install -y git jq tar gzip zstd curl unzip zip ca-certificates                      build-essential lld pkg-config libssl-dev
   apt-get install -y libicu-dev || true
   apt-get install -y docker.io || true
   systemctl enable --now docker 2>/dev/null || true
