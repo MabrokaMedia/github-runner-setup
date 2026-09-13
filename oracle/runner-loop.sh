@@ -28,6 +28,28 @@ PAT_FILE="${PAT_FILE:-/etc/gh-runner/pat}"
 HOME_DIR="${BASE_DIR}/slot-${SLOT}"
 cd "$HOME_DIR"
 
+# Reclaim this slot's old job directories before taking work, but only under
+# pressure. They hold the previous job's checkout and its incremental build,
+# which is worth keeping while there is room for it - and worth nothing at all
+# once the disk is full. A full disk does not fail a job cleanly: the runner
+# dies before the first step with "No space left on device" while trying to
+# write its own log, so the job shows as failed with nothing to read. That is
+# what happened on 2026-09-13, with 61 GB of stale workspaces across four
+# slots and every self-hosted job failing on arrival.
+#
+# Only this slot is touched. Another slot may be mid-job, and its _work is
+# where that job lives; with four slots cycling, each cleans itself as it
+# picks up work, which converges without ever reaching into a running job.
+FREE_FLOOR_GB="${FREE_FLOOR_GB:-20}"
+free_gb() { df -BG --output=avail / | tail -1 | tr -dc '0-9'; }
+if [ "$(free_gb)" -lt "$FREE_FLOOR_GB" ]; then
+  echo "slot ${SLOT}: $(free_gb)G free, below ${FREE_FLOOR_GB}G - clearing this slot's job directories"
+  # _actions, _tool, _temp and _PipelineMapping are the runner's own caches:
+  # small, and slow to rebuild. Only the per-repository directories go.
+  find "${HOME_DIR}/_work" -mindepth 1 -maxdepth 1 -type d ! -name '_*' -exec rm -rf {} + 2>/dev/null || true
+  echo "slot ${SLOT}: $(free_gb)G free after"
+fi
+
 GH_PAT="$(cat "$PAT_FILE")"
 
 # A previous run may have exited mid-job (reboot, OOM). GitHub still holds a
