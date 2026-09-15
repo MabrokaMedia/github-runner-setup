@@ -109,6 +109,36 @@ runs:
         echo "saving: ${PATHS[*]}"
         du -sh "${PATHS[@]}" 2>/dev/null || true
 
+        # A cache save is an OPTIMISATION. It must never fail the job — every
+        # consumer's workflow already says so in a comment, and this action was
+        # the one place that did not honour it.
+        #
+        # Returns 0 to promote the archive, 1 to skip the save (the caller then
+        # exits 0). `~/.cargo/registry` is one directory shared by all four
+        # runner slots on this host, so another slot's cargo writing into it
+        # while tar reads is routine, not exceptional: tar exits non-zero and
+        # the archive's hardlink dedup table can be inconsistent (the 2026-05-07
+        # `.cargo-ok` linked to a .der incident). Refusing to publish is right.
+        # Failing the job over it is not: the build already passed.
+        skip_save_if_unsound() {
+          local tar_rc="$1" zstd_rc="$2" stderr_file="$3" why=""
+          if grep -E -q "file changed as we read it|file shrank by|File removed before we read it" "${stderr_file}"; then
+            why="tar read a tree another runner slot was writing (shared ~/.cargo/registry)"
+          elif [[ "${tar_rc}" -ne 0 ]]; then
+            why="tar exited ${tar_rc}"
+          elif [[ "${zstd_rc}" -ne 0 ]]; then
+            why="zstd exited ${zstd_rc}"
+          fi
+          if [[ -n "${why}" ]]; then
+            # A warning annotation, not an error: visible on the run summary,
+            # and the job stays green. The existing cache is left untouched, so
+            # the next run restores the last archive that WAS sound.
+            echo "::warning title=Rust cache save skipped::${why}. The archive was not promoted and the existing cache is unchanged; this run's build output is simply not cached. Nothing about the build itself is affected."
+            return 1
+          fi
+          return 0
+        }
+
         if [ "${BACKEND}" = "auto" ]; then
           if [ "${RUNNER_ENVIRONMENT:-}" = "self-hosted" ]; then BACKEND=disk; else BACKEND=s3; fi
         fi
@@ -126,15 +156,25 @@ runs:
           TAR_STDERR="$(mktemp)"
           trap 'rm -f "${TAR_STDERR}" "${STAGING}"' EXIT
 
+          # `set +e` around the pipeline, on purpose. With `set -euo pipefail`
+          # in force, a non-zero tar killed the step on THIS line — before the
+          # concurrent-modification handler below could run. So the handler was
+          # unreachable for the exact case it was written for, and instead of a
+          # skipped save you got `Process completed with exit code 1` with no
+          # tar stderr and no explanation. Consumers that wrapped the step in
+          # `continue-on-error` survived; the ones that did not lost the job.
+          # davoxi-promo-exchange-business run 35020627148 (2026-09-15) failed
+          # its whole deploy this way, with every test already passed.
+          set +e
           tar -cf - "${PATHS[@]}" 2>"${TAR_STDERR}" | zstd -3 --long=27 -T0 -o "${STAGING}" -q -f
+          RC=("${PIPESTATUS[@]}")
+          set -e
 
           if [[ -s "${TAR_STDERR}" ]]; then
             echo "----- tar stderr -----"; cat "${TAR_STDERR}"; echo "----- end tar stderr -----"
           fi
-          if grep -E -q "file changed as we read it|file shrank by|File removed before we read it" "${TAR_STDERR}"; then
-            echo "ERROR: tar detected concurrent registry modification. Archive is not internally"
-            echo "       consistent and was NOT promoted. The existing cache remains untouched."
-            exit 1
+          if ! skip_save_if_unsound "${RC[0]}" "${RC[1]}" "${TAR_STDERR}"; then
+            exit 0
           fi
 
           mv -f "${STAGING}" "${FILE}"
@@ -172,11 +212,16 @@ runs:
             && aws s3 rm "s3://${BUCKET}/${STAGING_KEY}" >/dev/null 2>&1 || true
         ' EXIT
 
-        # Pipefail makes any stage failure (tar/zstd/aws) propagate. tar warnings go to stderr
-        # and DO NOT affect exit code by default — we grep the captured stderr separately.
+        # tar warnings go to stderr and do NOT affect its exit code, so the stderr grep below
+        # stays. But the exit codes must be captured rather than allowed to propagate: under
+        # `set -euo pipefail` a non-zero tar killed the step right here, before the
+        # concurrent-modification handler further down could run. See the disk path above.
+        set +e
         tar -cf - "${PATHS[@]}" 2>"${TAR_STDERR}" \
           | zstd -3 --long=27 -T0 \
           | aws s3 cp - "s3://${BUCKET}/${STAGING_KEY}" --no-progress --expected-size 5000000000
+        RC=("${PIPESTATUS[@]}")
+        set -e
 
         # Surface tar's stderr verbatim so it shows up in the job log.
         if [[ -s "${TAR_STDERR}" ]]; then
@@ -185,16 +230,20 @@ runs:
           echo "----- end tar stderr -----"
         fi
 
-        # Concurrent-modification warnings mean another process was writing to the registry
-        # while tar was reading it. The resulting archive can have inconsistent hardlink dedup
-        # tables (e.g. `.cargo-ok` linked to a `.der` from a different crate) — exactly the
-        # 2026-05-07 incident. Refuse to promote a tainted blob.
-        if grep -E -q "file changed as we read it|file shrank by|File removed before we read it" "${TAR_STDERR}"; then
-          echo "ERROR: tar detected concurrent registry modification. Local archive is not"
-          echo "       internally consistent and was NOT promoted to the canonical cache key."
-          echo "       Discarding staging blob. The canonical cache remains untouched."
-          exit 1
+        # The upload is the third stage here, so check it too — a failed PutObject must not
+        # leave us promoting a staging key that is absent or truncated.
+        if [[ "${RC[2]}" -ne 0 ]]; then
+          echo "::warning title=Rust cache save skipped::aws s3 cp exited ${RC[2]}. Nothing was promoted and the existing cache is unchanged; this run's build output is simply not cached."
+          exit 0
         fi
+        if ! skip_save_if_unsound "${RC[0]}" "${RC[1]}" "${TAR_STDERR}"; then
+          exit 0
+        fi
+
+        # (The concurrent-modification check that used to live here is now in
+        # skip_save_if_unsound, called above — together with tar's and zstd's exit codes,
+        # which under `set -e` never reached it. Same verdict, same reasons: a tainted blob
+        # is never promoted; the difference is the job no longer goes red over it.)
 
         # Promote: server-side copy staging -> canonical. This is atomic for a reader that
         # has not started yet, but NOT for one already mid-download: the CLI pulls large
