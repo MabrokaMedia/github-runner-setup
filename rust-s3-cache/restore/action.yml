@@ -88,6 +88,30 @@ runs:
         CARGO_ROOT="${CARGO_HOME:-$HOME/.cargo}"
         mkdir -p "${WORKSPACE_ABS}/target" "${CARGO_ROOT}/registry" "${CARGO_ROOT}/git"
 
+        # Called on the HIT paths only, immediately before `tar -xf`.
+        #
+        # `tar -xf - -C /` MERGES: it overwrites the paths it carries and leaves
+        # everything else alone. On an ephemeral runner target/ is empty, so the
+        # extracted tree is exactly the archive. On a persistent self-hosted slot
+        # it is not — target/ still holds whatever the previous job on that slot
+        # built — and the result is a union of two different commits' artifacts.
+        # A consumer cannot then reason about the tree it was handed: davoxi-backend
+        # stamps source mtimes against a `.built-at-commit` marker inside the
+        # archive, and any unit that exists in the leftovers but not in the archive
+        # keeps a dep-info mtime from an unrelated build, so cargo calls it fresh
+        # and links a stale rlib. That surfaces as "cannot find <symbol> in crate
+        # <x>" for a symbol that is demonstrably in the checkout.
+        #
+        # So make the extract mean what every caller already assumes: after a HIT,
+        # target/ IS the archive. Nothing else is cleared — in particular NOT the
+        # registry, which is one directory shared by every runner slot on the host
+        # and may be in use by another job right now. target/ lives under the
+        # per-slot _work tree and is ours alone.
+        replace_target() {
+          rm -rf "${WORKSPACE_ABS}/target"
+          mkdir -p "${WORKSPACE_ABS}/target"
+        }
+
         # `auto` keeps one action working in both places while workflows migrate:
         # the runner tells us which it is, so a self-hosted job uses its own disk
         # and a GitHub-hosted one still reaches the bucket.
@@ -109,6 +133,7 @@ runs:
             # already opened the old file keeps reading that inode. The failure
             # guard stays regardless, since a truncated archive is still
             # possible if the disk filled during a previous save.
+            replace_target
             if zstd -dc --long=27 "${FILE}" | tar -xf - -C /; then
               echo HIT-COMPLETE > "${STATE_FILE}"
               echo "cache-hit=true" >> "$GITHUB_OUTPUT"
@@ -144,6 +169,7 @@ runs:
           # mid-download and Clippy died here having linted nothing. Keys are shared across
           # concurrent runs, so this is reachable whenever two runs overlap: not a rare
           # corruption event.
+          replace_target
           if aws s3 cp "s3://${BUCKET}/${KEY}.tar.zst" - --no-progress | zstd -d --long=27 | tar -xf - -C /; then
             # Sentinel + cache-hit output written ONLY after tar fully succeeds. If the step is
             # cancelled mid-extract, neither line runs, and save will see no sentinel.
