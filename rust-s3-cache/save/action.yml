@@ -184,16 +184,31 @@ runs:
           # every repo on this host. Drop the least recently used archives once
           # the directory passes its budget, so a busy week cannot fill the
           # root filesystem and take the runners down with it.
+          #
+          # `ls -1t | tail -n +4` meant "keep the 3 newest, delete the rest",
+          # not "delete oldest until under budget". On this host that is 56
+          # live archives across 17 repos, so the first budget crossing would
+          # have deleted 53 of them — every repo but the two or three that
+          # built most recently. The `break` could not save them either: it is
+          # inside a `while` on the right-hand side of a pipe, so it runs in a
+          # subshell and the loop's own USED_MB never reaches the parent.
+          # A budget crossing should cost the coldest archive or two, not the
+          # whole host's cache.
           BUDGET_MB="${CACHE_BUDGET_MB:-40000}"
           USED_MB=$(du -sm "${CACHE_DIR}" 2>/dev/null | cut -f1)
           if [ "${USED_MB:-0}" -gt "${BUDGET_MB}" ]; then
-            echo "cache dir ${USED_MB} MB exceeds budget ${BUDGET_MB} MB — pruning oldest"
-            ls -1t "${CACHE_DIR}"/*.tar.zst 2>/dev/null | tail -n +4 | while read -r old; do
-              [ "${old}" = "${FILE}" ] && continue
-              rm -f "${old}" && echo "  pruned $(basename "${old}")"
-              USED_MB=$(du -sm "${CACHE_DIR}" 2>/dev/null | cut -f1)
+            echo "cache dir ${USED_MB} MB exceeds budget ${BUDGET_MB} MB — pruning oldest first"
+            # -r reverses `ls -t`, so the OLDEST archive comes first. No pipe:
+            # the loop runs in this shell, so USED_MB and `break` both work.
+            for old in $(ls -1tr "${CACHE_DIR}"/*.tar.zst 2>/dev/null); do
               [ "${USED_MB:-0}" -le "${BUDGET_MB}" ] && break
+              # Never evict the archive this job just wrote.
+              [ "${old}" = "${FILE}" ] && continue
+              OLD_MB=$(( $(stat -c%s "${old}" 2>/dev/null || echo 0) / 1048576 ))
+              rm -f "${old}" && echo "  pruned $(basename "${old}") (${OLD_MB} MB)"
+              USED_MB=$(( USED_MB - OLD_MB ))
             done
+            echo "cache dir now ~${USED_MB} MB (budget ${BUDGET_MB} MB)"
           fi
           exit 0
         fi

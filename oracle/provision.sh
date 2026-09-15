@@ -113,6 +113,48 @@ for i in $(seq 1 "$SLOTS"); do
     tar xzf "$BASE_DIR/$TARBALL" -C "$d"
     chown -R runner:runner "$d"
   fi
+
+  # ── Per-slot CARGO_HOME / RUSTUP_HOME ────────────────────────────────
+  # Every slot runs as the same `runner` user with the same $HOME, so all
+  # four resolved CARGO_HOME to /home/runner/.cargo and RUSTUP_HOME to
+  # /home/runner/.rustup. One directory, four concurrent writers. That is a
+  # single root cause with two faces, both seen on 2026-09-15:
+  #
+  #   * `rustc: command not found` then `/home/runner/.cargo/bin/rustc:
+  #     Text file busy` (exit 126) in *Install Rust*, when two slots run
+  #     dtolnay/rust-toolchain at the same moment and one rewrites a rustup
+  #     proxy while the other execs it.
+  #     davoxi-promo-exchange-business run 34970476795.
+  #   * the rust-s3-cache save tarring ~/.cargo/registry while another
+  #     slot's cargo writes into it, so tar exits non-zero.
+  #     davoxi-promo-exchange-business run 35020627148 lost a whole deploy.
+  #
+  # Neither is a transport flake and neither involves S3 (the cache backend
+  # resolves to `disk` here). Retrying just re-rolls the dice: the race
+  # fires whenever two Rust jobs overlap, which is the normal state of a
+  # four-slot host.
+  #
+  # The Actions runner reads `.env` from its own directory and applies it to
+  # every job, and dtolnay/rust-toolchain does
+  # `CARGO_HOME=${CARGO_HOME:-$HOME/.cargo} >> $GITHUB_ENV`, i.e. it honours
+  # an inherited value. So setting them here reaches every step of every job
+  # with no workflow changes in any consumer repo.
+  #
+  # Written every run so re-provisioning repairs a hand-edited file, and
+  # LANG is preserved because Rust jobs emit UTF-8 diagnostics.
+  #
+  # Cost: each slot keeps its own registry and toolchains instead of sharing
+  # one copy. Budget for it — see oracle/README.md. The slots pick the new
+  # values up on their next ephemeral restart, so no running job is
+  # disturbed and no manual restart is needed.
+  install -d -o runner -g runner "$d/.cargo" "$d/.rustup"
+  cat > "$d/.env" <<SLOTENV
+LANG=C.UTF-8
+CARGO_HOME=$d/.cargo
+RUSTUP_HOME=$d/.rustup
+SLOTENV
+  chown runner:runner "$d/.env"
+  chmod 644 "$d/.env"
 done
 chown -R runner:runner "$BASE_DIR"
 
