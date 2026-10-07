@@ -150,7 +150,10 @@ runs:
           # publish. mv(2) within one filesystem is atomic, so a reader either
           # sees the whole old archive or the whole new one, never a mixture —
           # which is stronger than the server-side copy S3 gives us.
-          mkdir -p "${CACHE_DIR}"
+          # Runners without /opt/gh-runner (and no rights to create it) keep
+          # the cache under their own home instead of failing the job: the
+          # cache is an optimisation, never a reason to stop a build.
+          mkdir -p "${CACHE_DIR}" 2>/dev/null || { CACHE_DIR="${HOME}/.cache/gh-runner-cache"; mkdir -p "${CACHE_DIR}"; echo "cache dir fallback: ${CACHE_DIR}"; }
           FILE="${CACHE_DIR}/${KEY//\//__}.tar.zst"
           STAGING="${FILE}.staging-${GITHUB_RUN_ID:-noid}-${GITHUB_RUN_ATTEMPT:-1}-${GITHUB_JOB:-job}"
           TAR_STDERR="$(mktemp)"
