@@ -124,8 +124,11 @@ runs:
           # Keys contain slashes (owner/repo/rust/<hash>); flatten rather than
           # nest, so the directory stays a flat set of archives that is trivial
           # to list, measure and prune.
+          # Runners without /opt/gh-runner (and no rights to create it) keep
+          # the cache under their own home instead of failing the job: the
+          # cache is an optimisation, never a reason to stop a build.
+          mkdir -p "${CACHE_DIR}" 2>/dev/null || { CACHE_DIR="${HOME}/.cache/gh-runner-cache"; mkdir -p "${CACHE_DIR}"; echo "cache dir fallback: ${CACHE_DIR}"; }
           FILE="${CACHE_DIR}/${KEY//\//__}.tar.zst"
-          mkdir -p "${CACHE_DIR}"
           if [ -f "${FILE}" ]; then
             echo "cache HIT: ${FILE} ($(stat -c%s "${FILE}") bytes)"
             # The multi-GB mid-download race that S3 has cannot happen here:
