@@ -48,11 +48,45 @@ if ! command -v aws >/dev/null 2>&1; then
   "$tmp/aws/install" --update >/dev/null
   rm -rf "$tmp"
 fi
-echo "    cc=$(command -v cc || echo MISSING)  aws=$(command -v aws || echo MISSING)"
+
+# GitHub CLI. ubuntu-latest ships it and the Amazon Linux AMI never needed it,
+# so workflows that moved here call `gh` without installing it. On a stock
+# Ubuntu image the step dies on "gh: command not found" (exit 127); in the
+# zendit deploy that is the Preflight `gh api .../branches/...`, which skips
+# the Cloud Run deploy behind it (runs 37732041019, 37911731440).
+#
+# Installed from GitHub's own package repo rather than a tarball so routine
+# `apt upgrade` / `dnf upgrade` keeps it current. It lands in /usr/bin, which
+# is on systemd's default PATH, so every slot sees it with no .env change.
+if ! command -v gh >/dev/null 2>&1; then
+  echo "==> gh cli"
+  if command -v dnf >/dev/null 2>&1; then
+    curl -fsSL https://cli.github.com/packages/rpm/gh-cli.repo -o /etc/yum.repos.d/gh-cli.repo
+    dnf install -y gh
+  else
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    chmod 0644 /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list
+    apt-get update -y
+    apt-get install -y gh
+  fi
+fi
+echo "    cc=$(command -v cc || echo MISSING)  aws=$(command -v aws || echo MISSING)  gh=$(command -v gh || echo MISSING)"
 
 echo "==> runner user"
 id runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner
 getent group docker >/dev/null 2>&1 && usermod -aG docker runner || true
+
+# Check as the user and PATH the slots actually run with, not as root: a tool
+# root can find but the service cannot is exactly the failure this prevents.
+for tool in gh aws cc; do
+  runuser -u runner -- env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    sh -c "command -v $tool" >/dev/null \
+    || { echo "$tool is not on PATH for the runner user" >&2; exit 1; }
+done
 
 echo "==> config"
 # root:runner, not root:root. The units run as `runner`, so root-only files
