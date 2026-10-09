@@ -48,6 +48,38 @@ if ! command -v aws >/dev/null 2>&1; then
   "$tmp/aws/install" --update >/dev/null
   rm -rf "$tmp"
 fi
+
+# Tools GitHub's ubuntu-latest image ships and a lot of workflows assume,
+# without an install step of their own. Moving a job here from GitHub-hosted
+# (to stop paying for minutes) otherwise fails on "command not found" in a
+# step that has worked for months:
+#   - gh:      deploy preflights (`gh api`, `gh run cancel`)
+#   - node:    cloudflare/wrangler-action and bare `npx` steps
+#   - pip:     validation jobs that `pip install` into the system python
+# All three are installed system-wide because jobs run as `runner`, which
+# has no sudo and so cannot install them itself.
+echo "==> hosted-image parity (gh, node, pip)"
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get install -y python3-pip python3-venv || true
+else
+  dnf install -y python3-pip || true
+fi
+NODE_MAJOR="${NODE_MAJOR:-22}"
+if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" != "$NODE_MAJOR" ]; then
+  tmp=$(mktemp -d)
+  file=$(curl -fsSL "https://nodejs.org/dist/latest-v${NODE_MAJOR}.x/SHASUMS256.txt" | awk '/linux-arm64\.tar\.xz$/{print $2}')
+  curl -fsSL "https://nodejs.org/dist/latest-v${NODE_MAJOR}.x/$file" -o "$tmp/node.tar.xz"
+  tar -xJf "$tmp/node.tar.xz" -C /usr/local --strip-components=1
+  rm -rf "$tmp"
+fi
+if ! command -v gh >/dev/null 2>&1; then
+  tmp=$(mktemp -d)
+  ver=$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest | jq -r .tag_name | sed 's/^v//')
+  curl -fsSL "https://github.com/cli/cli/releases/download/v${ver}/gh_${ver}_linux_arm64.tar.gz" -o "$tmp/gh.tgz"
+  tar -xzf "$tmp/gh.tgz" -C "$tmp"
+  install -m 0755 "$tmp/gh_${ver}_linux_arm64/bin/gh" /usr/local/bin/gh
+  rm -rf "$tmp"
+fi
 echo "    cc=$(command -v cc || echo MISSING)  aws=$(command -v aws || echo MISSING)"
 
 echo "==> runner user"
