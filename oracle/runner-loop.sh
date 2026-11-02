@@ -40,8 +40,26 @@ cd "$HOME_DIR"
 # Only this slot is touched. Another slot may be mid-job, and its _work is
 # where that job lives; with four slots cycling, each cleans itself as it
 # picks up work, which converges without ever reaching into a running job.
-FREE_FLOOR_GB="${FREE_FLOOR_GB:-20}"
+#
+# The floor is 50G because parlo-seo's full rebuild refuses to start below 45G
+# free, and at 20G it never got there: on 2026-11-02 the disk sat at 35-45G
+# free with 37G of it in shared-cache entries nobody had read for a week.
+FREE_FLOOR_GB="${FREE_FLOOR_GB:-50}"
+CACHE_DIR="${CACHE_DIR:-${BASE_DIR}/cache}"
 free_gb() { df -BG --output=avail / | tail -1 | tr -dc '0-9'; }
+if [ "$(free_gb)" -lt "$FREE_FLOOR_GB" ]; then
+  # Dead weight first: shared-cache entries unread for a week (relatime keeps
+  # atime to within a day), and docker images, volumes and build cache that no
+  # container uses. A running build's files are fresh, so neither touches one.
+  echo "slot ${SLOT}: $(free_gb)G free, below ${FREE_FLOOR_GB}G - pruning stale caches"
+  find "$CACHE_DIR" -type f -atime +7 -delete 2>/dev/null || true
+  if command -v docker >/dev/null 2>&1; then
+    docker image prune -af --filter until=168h >/dev/null 2>&1 || true
+    docker volume prune -af >/dev/null 2>&1 || true
+    docker builder prune -af --filter until=168h >/dev/null 2>&1 || true
+  fi
+  echo "slot ${SLOT}: $(free_gb)G free after pruning"
+fi
 if [ "$(free_gb)" -lt "$FREE_FLOOR_GB" ]; then
   echo "slot ${SLOT}: $(free_gb)G free, below ${FREE_FLOOR_GB}G - clearing this slot's job directories"
   # _actions, _tool, _temp and _PipelineMapping are the runner's own caches:
