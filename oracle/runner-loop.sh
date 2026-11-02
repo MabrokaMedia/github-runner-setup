@@ -48,15 +48,24 @@ FREE_FLOOR_GB="${FREE_FLOOR_GB:-50}"
 CACHE_DIR="${CACHE_DIR:-${BASE_DIR}/cache}"
 free_gb() { df -BG --output=avail / | tail -1 | tr -dc '0-9'; }
 if [ "$(free_gb)" -lt "$FREE_FLOOR_GB" ]; then
-  # Dead weight first: shared-cache entries unread for a week (relatime keeps
-  # atime to within a day), and docker images, volumes and build cache that no
-  # container uses. A running build's files are fresh, so neither touches one.
-  echo "slot ${SLOT}: $(free_gb)G free, below ${FREE_FLOOR_GB}G - pruning stale caches"
-  find "$CACHE_DIR" -type f -atime +7 -delete 2>/dev/null || true
+  # Docker leftovers first: images, volumes and build cache that no container
+  # uses. Nothing in a deploy reads them.
+  echo "slot ${SLOT}: $(free_gb)G free, below ${FREE_FLOOR_GB}G - pruning"
   if command -v docker >/dev/null 2>&1; then
     docker image prune -af --filter until=168h >/dev/null 2>&1 || true
     docker volume prune -af >/dev/null 2>&1 || true
     docker builder prune -af --filter until=168h >/dev/null 2>&1 || true
+  fi
+  # Then the shared build cache, least recently read first, and only as much
+  # as it takes to get back to the floor: the cache is what keeps deploys
+  # fast, so it keeps everything it has room for. Entries read in the last
+  # two days are never evicted (relatime keeps atime to within a day), which
+  # also keeps a running build's own files out of reach.
+  short_kb=$(( (FREE_FLOOR_GB - $(free_gb)) * 1024 * 1024 ))
+  if [ "$short_kb" -gt 0 ] && [ -d "$CACHE_DIR" ]; then
+    find "$CACHE_DIR" -type f -atime +1 -printf '%A@ %k %p\n' 2>/dev/null | sort -n |
+      awk -v need="$short_kb" '{ print substr($0, index($0, $3)); got += $2; if (got >= need) exit }' |
+      tr '\n' '\0' | xargs -0 -r rm -f
   fi
   echo "slot ${SLOT}: $(free_gb)G free after pruning"
 fi
