@@ -19,6 +19,20 @@ Both labels sit on every slot. On EC2 the split exists because `fast` is spot
 and `stable` is on-demand; here there is no spot market, so the distinction has
 nothing to express and either slot serves either job.
 
+## Creating the host
+
+Free ARM capacity is often exhausted, and the console then answers "Out of
+capacity" in every availability domain. `create-instance.sh` keeps trying all
+of them until one launch succeeds (default: every 5 minutes for 72 hours):
+
+    oci setup config          # once; add the printed public key in the console
+                              # (Profile > Tokens and keys > Add API key)
+    ./oracle/create-instance.sh
+
+It creates `gh-runner-oracle-2` within the free limits (2 OCPUs, 12 GB, since
+Oracle lowered them; a 4 OCPU / 24 GB host was disabled on 2026-11-08) and
+stops at once if that instance already exists.
+
 ## Switching
 
 Nothing to deploy. The only state is which runners are online.
